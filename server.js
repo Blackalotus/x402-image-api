@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Native EIP-1193 Web3 Signature
+// 1. Human UI Homepage Route using ESM Official x402 Paywall Module
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -37,15 +37,18 @@ app.get('/', (req, res) => {
         <h1>AI Image Generator <span class="badge">x402 Active</span></h1>
         <p>Enter a prompt below. Payment of $0.05 Base USDC will be prompted via your connected wallet.</p>
         <input type="text" id="prompt" placeholder="Type your prompt here..." value="" />
-        <button id="btn" onclick="generate()">Generate Image ($0.05 Base USDC)</button>
+        <button id="btn">Generate Image ($0.05 Base USDC)</button>
         <div id="status"></div>
       </div>
 
-      <script>
-        async function generate() {
+      <script type="module">
+        import { createPaywall } from 'https://esm.sh/@x402/paywall@2.0.0';
+
+        const btn = document.getElementById('btn');
+        const statusDiv = document.getElementById('status');
+
+        btn.addEventListener('click', async () => {
           const promptInput = document.getElementById('prompt').value.trim();
-          const statusDiv = document.getElementById('status');
-          const btn = document.getElementById('btn');
 
           if (!promptInput) {
             statusDiv.className = "error";
@@ -55,73 +58,27 @@ app.get('/', (req, res) => {
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
           statusDiv.className = "";
-          statusDiv.innerText = "1/3 Checking resource payment requirement...";
+          statusDiv.innerText = "Opening wallet for payment authorization...";
           btn.disabled = true;
 
           try {
-            // Step 1: Initial fetch to get 402 requirements header
-            let response = await fetch(endpoint);
-
-            if (response.status === 402) {
-              const paymentReqHeader = response.headers.get('PAYMENT-REQUIRED') || response.headers.get('x-payment-required');
-              
-              if (!window.ethereum) {
-                throw new Error("No Web3 wallet detected. Please open in Phantom, Coinbase Wallet, or MetaMask.");
-              }
-
-              statusDiv.innerText = "2/3 Connecting wallet & requesting signature...";
-
-              // Request account access
-              const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-              const userAddress = accounts[0];
-
-              // Parse requirements
-              let reqData = {};
-              try {
-                reqData = paymentReqHeader ? JSON.parse(paymentReqHeader) : {};
-              } catch (e) {
-                reqData = {};
-              }
-
-              // Message to sign for x402 EVM authorization
-              const message = "Authorize x402 Micropayment of $0.05 USDC to " + "${WALLET_ADDRESS}";
-              
-              // Sign message via wallet
-              const signature = await window.ethereum.request({
-                method: 'personal_sign',
-                params: [message, userAddress],
-              });
-
-              statusDiv.innerText = "3/3 Verifying payment authorization with facilitator...";
-
-              // Step 2: Retry fetch with X-PAYMENT authorization payload
-              const paymentPayload = JSON.stringify({
-                address: userAddress,
-                signature: signature,
-                message: message
-              });
-
-              response = await fetch(endpoint, {
-                headers: {
-                  'X-PAYMENT': paymentPayload
-                }
-              });
-            }
+            const paywall = createPaywall();
+            const response = await paywall.fetch(endpoint);
 
             if (!response.ok) {
-              throw new Error("Payment verification failed (HTTP " + response.status + ")");
+              throw new Error("HTTP Error " + response.status);
             }
 
             const data = await response.json();
             statusDiv.className = "success";
-            statusDiv.innerText = "Success! " + JSON.stringify(data);
+            statusDiv.innerText = "Payment Verified! Result: " + JSON.stringify(data);
           } catch (err) {
             statusDiv.className = "error";
-            statusDiv.innerText = "Error: " + err.message;
+            statusDiv.innerText = "Payment error: " + err.message;
           } finally {
             btn.disabled = false;
           }
-        }
+        });
       </script>
     </body>
     </html>
