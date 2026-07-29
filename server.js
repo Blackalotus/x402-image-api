@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Error Debugging
+// 1. Human UI Homepage Route with Native EIP-1193 Web3 Signature
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -18,7 +18,6 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>AI Image Studio | x402 Micropayments</title>
-      <script src="https://unpkg.com/@x402/paywall@latest/dist/paywall.js"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 480px; width: 100%; border: 1px solid #334155; }
@@ -30,6 +29,7 @@ app.get('/', (req, res) => {
         button:hover { background: #1d4ed8; }
         #status { margin-top: 1rem; font-size: 0.85rem; color: #38bdf8; word-break: break-all; }
         .error { color: #ef4444 !important; font-weight: bold; }
+        .success { color: #4ade80 !important; font-weight: bold; }
       </style>
     </head>
     <body>
@@ -48,41 +48,76 @@ app.get('/', (req, res) => {
           const btn = document.getElementById('btn');
 
           if (!promptInput) {
+            statusDiv.className = "error";
             statusDiv.innerText = "Please enter a prompt first.";
             return;
           }
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
-          statusDiv.innerText = "Connecting to wallet...";
           statusDiv.className = "";
+          statusDiv.innerText = "1/3 Checking resource payment requirement...";
           btn.disabled = true;
 
           try {
-            let fetchFn = window.fetch;
-            
-            // Check which x402 global the CDN actually loaded
-            if (window.x402Paywall && window.x402Paywall.fetch) {
-              fetchFn = window.x402Paywall.fetch.bind(window.x402Paywall);
-            } else if (window.x402 && window.x402.fetch) {
-              fetchFn = window.x402.fetch.bind(window.x402);
-            } else {
-              throw new Error("x402 Paywall SDK is not loaded. Check CDN link or browser blockers.");
+            // Step 1: Initial fetch to get 402 requirements header
+            let response = await fetch(endpoint);
+
+            if (response.status === 402) {
+              const paymentReqHeader = response.headers.get('PAYMENT-REQUIRED') || response.headers.get('x-payment-required');
+              
+              if (!window.ethereum) {
+                throw new Error("No Web3 wallet detected. Please open in Phantom, Coinbase Wallet, or MetaMask.");
+              }
+
+              statusDiv.innerText = "2/3 Connecting wallet & requesting signature...";
+
+              // Request account access
+              const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+              const userAddress = accounts[0];
+
+              // Parse requirements
+              let reqData = {};
+              try {
+                reqData = paymentReqHeader ? JSON.parse(paymentReqHeader) : {};
+              } catch (e) {
+                reqData = {};
+              }
+
+              // Message to sign for x402 EVM authorization
+              const message = "Authorize x402 Micropayment of $0.05 USDC to " + "${WALLET_ADDRESS}";
+              
+              // Sign message via wallet
+              const signature = await window.ethereum.request({
+                method: 'personal_sign',
+                params: [message, userAddress],
+              });
+
+              statusDiv.innerText = "3/3 Verifying payment authorization with facilitator...";
+
+              // Step 2: Retry fetch with X-PAYMENT authorization payload
+              const paymentPayload = JSON.stringify({
+                address: userAddress,
+                signature: signature,
+                message: message
+              });
+
+              response = await fetch(endpoint, {
+                headers: {
+                  'X-PAYMENT': paymentPayload
+                }
+              });
             }
 
-            const response = await fetchFn(endpoint);
-            
-            if (response.status === 402) {
-              throw new Error("Wallet failed to intercept the 402 Payment Required request.");
-            }
             if (!response.ok) {
-              throw new Error("HTTP Error: " + response.status);
+              throw new Error("Payment verification failed (HTTP " + response.status + ")");
             }
 
             const data = await response.json();
-            statusDiv.innerText = "Access Granted! Result: " + JSON.stringify(data);
+            statusDiv.className = "success";
+            statusDiv.innerText = "Success! " + JSON.stringify(data);
           } catch (err) {
-            statusDiv.innerText = "Error: " + err.message;
             statusDiv.className = "error";
+            statusDiv.innerText = "Error: " + err.message;
           } finally {
             btn.disabled = false;
           }
