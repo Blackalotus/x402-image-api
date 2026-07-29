@@ -18,6 +18,11 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>AI Image Studio | x402 Micropayments</title>
+      <!-- Load x402 Client Fetch Library -->
+      <script type="module">
+        import { x402Fetch } from 'https://esm.sh/@x402/fetch@latest';
+        window.x402Fetch = x402Fetch;
+      </script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 480px; width: 100%; border: 1px solid #334155; }
@@ -51,20 +56,18 @@ app.get('/', (req, res) => {
           }
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
-          statusDiv.innerText = "Processing request...";
+          statusDiv.innerText = "Connecting wallet & prompting payment...";
           btn.disabled = true;
 
           try {
-            const res = await fetch(endpoint);
-            if (res.status === 402) {
-              const payData = await res.json();
-              statusDiv.innerText = "Payment Required ($0.05 USDC). Please approve in wallet.";
-            } else {
-              const data = await res.json();
-              statusDiv.innerText = "Success: " + JSON.stringify(data);
-            }
+            // Use x402Fetch if loaded to prompt wallet signature automatically
+            const fetchFn = window.x402Fetch || window.fetch;
+            const res = await fetchFn(endpoint);
+            
+            const data = await res.json();
+            statusDiv.innerText = "Success: " + JSON.stringify(data);
           } catch (err) {
-            statusDiv.innerText = "Error completing request.";
+            statusDiv.innerText = "Payment cancelled or failed.";
           } finally {
             btn.disabled = false;
           }
