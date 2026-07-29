@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Embedded Wallet Paywall Handler
+// 1. Human UI Homepage Route with Client Paywall Auto-Trigger
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -28,7 +28,7 @@ app.get('/', (req, res) => {
         input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; margin-bottom: 1rem; box-sizing: border-box; }
         button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-weight: bold; cursor: pointer; transition: 0.2s; }
         button:hover { background: #1d4ed8; }
-        #result { margin-top: 1rem; word-break: break-all; color: #38bdf8; font-size: 0.85rem; }
+        #result { margin-top: 1rem; word-break: break-all; color: #38bdf8; font-size: 0.85rem; font-weight: 500; }
       </style>
     </head>
     <body>
@@ -36,7 +36,7 @@ app.get('/', (req, res) => {
         <h1>AI Image Generator <span class="badge">x402 Active</span></h1>
         <p>Enter a prompt below. Payment of $0.05 Base USDC will be prompted via your connected wallet.</p>
         <input type="text" id="prompt" placeholder="e.g. Cyberpunk city in neon rain..." value="Cyberpunk city in neon rain">
-        <button onclick="generate()">Generate Image ($0.05 Base USDC)</button>
+        <button id="btn" onclick="generate()">Generate Image ($0.05 Base USDC)</button>
         <div id="result"></div>
       </div>
 
@@ -45,15 +45,30 @@ app.get('/', (req, res) => {
           const prompt = encodeURIComponent(document.getElementById('prompt').value);
           const endpoint = '/api/v1/generate-image?prompt=' + prompt;
           const resultDiv = document.getElementById('result');
-          resultDiv.innerText = "Requesting payment from wallet...";
+          const btn = document.getElementById('btn');
+
+          resultDiv.innerText = "Connecting wallet & requesting payment...";
+          btn.disabled = true;
 
           try {
-            // Fetch via JS fetch so 402 is handled in-browser by paywall SDK or intercepted
-            const response = await fetch(endpoint);
+            // Use x402Paywall wrapper if loaded, otherwise fallback to paywall fetch
+            let response;
+            if (window.x402 && window.x402.fetch) {
+              response = await window.x402.fetch(endpoint);
+            } else if (window.x402Paywall) {
+              response = await window.x402Paywall.fetch(endpoint);
+            } else {
+              // Redirect directly to the route so browser wallet extension or mobile app handles 402
+              window.location.href = endpoint;
+              return;
+            }
+
             const data = await response.json();
-            resultDiv.innerText = JSON.stringify(data, null, 2);
+            resultDiv.innerText = "Success! " + JSON.stringify(data);
           } catch (err) {
-            resultDiv.innerText = "Payment required or cancelled.";
+            resultDiv.innerText = "Payment failed or was cancelled.";
+          } finally {
+            btn.disabled = false;
           }
         }
       </script>
