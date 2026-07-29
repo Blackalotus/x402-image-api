@@ -1,5 +1,5 @@
 import express from 'express';
-import { paymentMiddleware } from '@x402/express';
+import { paymentMiddleware, x402ResourceServer } from '@x402/express';
 
 const app = express();
 app.set('trust proxy', true); 
@@ -49,16 +49,19 @@ app.get('/', (req, res) => {
 });
 
 // 2. x402 Micropayment Protection
-app.use(
-  paymentMiddleware( {
+const x402Server = new x402ResourceServer({
+  payTo: WALLET_ADDRESS,
+  routes: {
     'GET /api/v1/generate-image': {
       price: '$0.05',
       network: 'base',
-      payTo: WALLET_ADDRESS,
       resource: 'https://x402-image-api.onrender.com/api/v1/generate-image'
     }
-  })
-);
+  }
+});
+
+app.use(paymentMiddleware(x402Server));
+
 
 // 3. Protected Route
 app.get('/api/v1/generate-image', (req, res) => {
