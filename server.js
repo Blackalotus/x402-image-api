@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Guaranteed Phantom EVM Trigger
+// 1. Human UI Homepage Route with x402 Client SDK
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -55,65 +55,50 @@ app.get('/', (req, res) => {
 
           if (!window.ethereum) {
             statusDiv.className = "error";
-            statusDiv.innerText = "No Web3 browser wallet detected. Open in Phantom, Coinbase Wallet, or Rainbow.";
+            statusDiv.innerText = "No Web3 browser wallet detected. Open in MetaMask, Coinbase Wallet, or Phantom.";
             return;
           }
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
           statusDiv.className = "";
-          statusDiv.innerText = "1/3 Connecting wallet & switching to Base...";
+          statusDiv.innerText = "1/3 Loading x402 protocol client...";
           btn.disabled = true;
 
           try {
-            // Request accounts
-            const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-            const fromAddress = accounts[0];
+            // Import SDK modules dynamically via ESM
+            const { x402Client } = await import('https://esm.sh/@x402/client@latest');
+            const { ExactEvmScheme } = await import('https://esm.sh/@x402/evm@latest/exact/client');
 
-            // Force wallet to Base Mainnet (Chain ID 0x2105 = 8453)
+            // Connect wallet
+            const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+            const userAddress = accounts[0];
+
+            // Ensure network is Base Mainnet
             try {
               await window.ethereum.request({
                 method: 'wallet_switchEthereumChain',
                 params: [{ chainId: '0x2105' }],
               });
-            } catch (switchError) {
-              // Ignore if wallet is already on Base or doesn't throw
-            }
+            } catch (e) {}
 
-            statusDiv.innerText = "2/3 Confirming authorization signature in wallet...";
+            statusDiv.innerText = "2/3 Prompting $0.05 Base USDC permit in wallet...";
 
-            const now = Math.floor(Date.now() / 1000);
-            const messageToSign = "Authorize x402 Micropayment: $0.05 Base USDC to ${WALLET_ADDRESS} | Timestamp: " + now;
+            // Signer callback using EIP-712 eth_signTypedData_v4
+            const signer = async (typedData) => {
+              return await window.ethereum.request({
+                method: 'eth_signTypedData_v4',
+                params: [userAddress, JSON.stringify(typedData)]
+              });
+            };
 
-            // Trigger universal personal_sign supported across Phantom, Coinbase, Rainbow, MetaMask
-            const signature = await window.ethereum.request({
-              method: 'personal_sign',
-              params: [messageToSign, fromAddress],
-            });
+            const client = new x402Client();
+            client.register('eip155:8453', new ExactEvmScheme(signer));
 
-            statusDiv.innerText = "3/3 Verifying micropayment with server...";
-
-            const paymentHeaderPayload = btoa(JSON.stringify({
-              scheme: 'exact',
-              network: 'eip155:8453',
-              payload: {
-                signature: signature,
-                authorization: {
-                  from: fromAddress,
-                  to: '${WALLET_ADDRESS}',
-                  value: '50000',
-                  message: messageToSign
-                }
-              }
-            }));
-
-            const response = await fetch(endpoint, {
-              headers: {
-                'X-PAYMENT': paymentHeaderPayload
-              }
-            });
+            // Perform 402 fetch & handle signed payload construction automatically
+            const response = await client.fetch(endpoint);
 
             if (!response.ok) {
-              throw new Error("HTTP " + response.status + ": Micropayment authorization check failed.");
+              throw new Error("HTTP " + response.status + ": Authorization failed");
             }
 
             const data = await response.json();
