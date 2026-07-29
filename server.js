@@ -89,7 +89,7 @@ app.get('/', (req, res) => {
             const authorizationMsg = {
               from: userAddress,
               to: '${WALLET_ADDRESS}',
-              value: '50000', // $0.05 USDC in 6 decimal atomic units
+              value: '50000', // $0.05 USDC (6 decimals)
               validAfter: '0',
               validBefore: String(now + 3600),
               nonce: nonce
@@ -122,7 +122,7 @@ app.get('/', (req, res) => {
               message: authorizationMsg
             };
 
-            // Request wallet EIP-712 signature
+            // Request wallet signature
             const signature = await window.ethereum.request({
               method: 'eth_signTypedData_v4',
               params: [userAddress, JSON.stringify(typedData)]
@@ -130,7 +130,6 @@ app.get('/', (req, res) => {
 
             statusDiv.innerText = "3/3 Verifying micropayment with server...";
 
-            // Construct standard x402 payment payload
             const x402Payload = {
               x402Version: 2,
               scheme: 'exact',
@@ -169,9 +168,9 @@ app.get('/', (req, res) => {
   `);
 });
 
-// 2. Initialize Facilitator & x402 Resource Server
+// 2. Initialize Facilitator & x402 Resource Server (PayAI supports Base Mainnet eip155:8453)
 const facilitatorClient = new HTTPFacilitatorClient({
-  url: 'https://x402.org/facilitator',
+  url: 'https://facilitator.payai.network',
 });
 
 const x402Server = new x402ResourceServer(facilitatorClient);
