@@ -64,6 +64,7 @@ app.use(paymentMiddleware(routes, x402Server));
 
 
 
+
 // 3. Protected Route
 app.get('/api/v1/generate-image', (req, res) => {
   res.json({
