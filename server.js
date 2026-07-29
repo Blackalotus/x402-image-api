@@ -13,7 +13,7 @@ app.use(
     'GET /api/v1/generate-image': {
       price: '$0.05',
       network: 'base',
-      resource: 'resource: 'https://x402-image-api.onrender.com/api/v1/generate-image'
+      resource: 'https://x402-image-api.onrender.com/api/v1/generate-image'
     }
   })
 );
