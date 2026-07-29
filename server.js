@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route
+// 1. Human UI Homepage Route with Native x402 Web Client Bundle
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -41,6 +41,14 @@ app.get('/', (req, res) => {
         <div id="status"></div>
       </div>
 
+      <script type="module">
+        import { x402Client } from 'https://cdn.jsdelivr.net/npm/@x402/client/+esm';
+        import { ExactEvmScheme } from 'https://cdn.jsdelivr.net/npm/@x402/evm@latest/exact/client/+esm';
+
+        window.x402Client = x402Client;
+        window.ExactEvmScheme = ExactEvmScheme;
+      </script>
+
       <script>
         async function generate() {
           const promptInput = document.getElementById('prompt').value.trim();
@@ -61,15 +69,13 @@ app.get('/', (req, res) => {
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
           statusDiv.className = "";
-          statusDiv.innerText = "1/3 Connecting wallet & checking network...";
+          statusDiv.innerText = "1/3 Connecting wallet...";
           btn.disabled = true;
 
           try {
-            // Request Wallet Connection
             const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
             const userAddress = accounts[0];
 
-            // Switch to Base Mainnet (0x2105 = 8453)
             try {
               await window.ethereum.request({
                 method: 'wallet_switchEthereumChain',
@@ -77,76 +83,39 @@ app.get('/', (req, res) => {
               });
             } catch (e) {}
 
-            statusDiv.innerText = "2/3 Confirming $0.05 Base USDC Authorization in wallet...";
+            statusDiv.innerText = "2/3 Confirming $0.05 Base USDC authorization in wallet...";
 
-            const now = Math.floor(Date.now() / 1000);
-            
-            // Generate 32-byte hex nonce
-            const array = new Uint8Array(32);
-            window.crypto.getRandomValues(array);
-            const nonce = '0x' + Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
-
-            const authorizationMsg = {
-              from: userAddress,
-              to: '${WALLET_ADDRESS}',
-              value: '50000', // $0.05 USDC (6 decimals)
-              validAfter: '0',
-              validBefore: String(now + 3600),
-              nonce: nonce
-            };
-
-            const typedData = {
-              domain: {
-                name: 'USD Coin',
-                version: '2',
-                chainId: 8453,
-                verifyingContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
-              },
-              types: {
-                EIP712Domain: [
-                  { name: 'name', type: 'string' },
-                  { name: 'version', type: 'string' },
-                  { name: 'chainId', type: 'uint256' },
-                  { name: 'verifyingContract', type: 'address' }
-                ],
-                TransferWithAuthorization: [
-                  { name: 'from', type: 'address' },
-                  { name: 'to', type: 'address' },
-                  { name: 'value', type: 'uint256' },
-                  { name: 'validAfter', type: 'uint256' },
-                  { name: 'validBefore', type: 'uint256' },
-                  { name: 'nonce', type: 'bytes32' }
-                ]
-              },
-              primaryType: 'TransferWithAuthorization',
-              message: authorizationMsg
-            };
-
-            // Request wallet signature
-            const signature = await window.ethereum.request({
-              method: 'eth_signTypedData_v4',
-              params: [userAddress, JSON.stringify(typedData)]
-            });
-
-            statusDiv.innerText = "3/3 Verifying micropayment with server...";
-
-            const x402Payload = {
-              x402Version: 2,
-              scheme: 'exact',
-              network: 'eip155:8453',
-              payload: {
-                signature: signature,
-                authorization: authorizationMsg
+            // Signer instance wrapping eth_signTypedData_v4 for x402 client
+            const signer = {
+              getAddress: async () => userAddress,
+              signTypedData: async (domain, types, value) => {
+                const typedData = {
+                  domain,
+                  types: {
+                    EIP712Domain: [
+                      { name: 'name', type: 'string' },
+                      { name: 'version', type: 'string' },
+                      { name: 'chainId', type: 'uint256' },
+                      { name: 'verifyingContract', type: 'address' }
+                    ],
+                    ...types
+                  },
+                  primaryType: 'TransferWithAuthorization',
+                  message: value
+                };
+                return await window.ethereum.request({
+                  method: 'eth_signTypedData_v4',
+                  params: [userAddress, JSON.stringify(typedData)]
+                });
               }
             };
 
-            const paymentHeader = btoa(JSON.stringify(x402Payload));
+            const client = new window.x402Client();
+            client.register('eip155:8453', new window.ExactEvmScheme(signer));
 
-            const response = await fetch(endpoint, {
-              headers: {
-                'X-PAYMENT': paymentHeader
-              }
-            });
+            statusDiv.innerText = "3/3 Verifying micropayment with PayAI server...";
+
+            const response = await client.fetch(endpoint);
 
             if (!response.ok) {
               throw new Error("HTTP " + response.status + ": Verification Failed");
@@ -168,7 +137,7 @@ app.get('/', (req, res) => {
   `);
 });
 
-// 2. Initialize Facilitator & x402 Resource Server (PayAI supports Base Mainnet eip155:8453)
+// 2. Initialize Facilitator Client for PayAI
 const facilitatorClient = new HTTPFacilitatorClient({
   url: 'https://facilitator.payai.network',
 });
