@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Native Paywall Script
+// 1. Human UI Homepage Route with Official x402 Paywall Modal
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -18,7 +18,7 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>AI Image Studio | x402 Micropayments</title>
-      <script src="https://unpkg.com/@x402/paywall@latest/dist/paywall.min.js"></script>
+      <script src="https://unpkg.com/@x402/paywall@latest/dist/paywall.js"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 480px; width: 100%; border: 1px solid #334155; }
@@ -52,14 +52,17 @@ app.get('/', (req, res) => {
           }
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
-          statusDiv.innerText = "Connecting wallet & prompting payment...";
+          statusDiv.innerText = "Connecting to wallet...";
           btn.disabled = true;
 
           try {
-            // Force browser navigation so mobile wallet dApp browser intercepts 402 header
-            window.location.href = endpoint;
+            // x402Paywall wraps window.fetch to capture 402 responses and display the wallet UI overlay
+            const response = await window.x402Paywall.fetch(endpoint);
+            const data = await response.json();
+            statusDiv.innerText = "Access Granted! Result: " + JSON.stringify(data);
           } catch (err) {
-            statusDiv.innerText = "Payment failed or was cancelled.";
+            statusDiv.innerText = "Payment canceled or failed.";
+          } finally {
             btn.disabled = false;
           }
         }
@@ -69,7 +72,7 @@ app.get('/', (req, res) => {
   `);
 });
 
-// 2. Initialize Active Facilitator & Resource Server
+// 2. Initialize Facilitator & x402 Resource Server
 const facilitatorClient = new HTTPFacilitatorClient({
   url: 'https://facilitator.payai.network',
 });
@@ -77,7 +80,7 @@ const facilitatorClient = new HTTPFacilitatorClient({
 const x402Server = new x402ResourceServer(facilitatorClient);
 x402Server.register('eip155:8453', new ExactEvmScheme());
 
-// 3. x402 Micropayment Protection
+// 3. Configure Micropayment Protection
 const routes = {
   'GET /api/v1/generate-image': {
     accepts: [
