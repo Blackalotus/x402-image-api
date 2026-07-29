@@ -1,5 +1,5 @@
 import express from 'express';
-import { paymentMiddleware } from 'x402-express';
+import { paymentMiddleware } from '@x402-express';
 
 const app = express();
 app.set('trust proxy', true); 
