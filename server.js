@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route
+// 1. Human UI Homepage Route with Native Paywall Script
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -18,11 +18,7 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>AI Image Studio | x402 Micropayments</title>
-      <!-- Load x402 Client Fetch Library -->
-      <script type="module">
-        import { x402Fetch } from 'https://esm.sh/@x402/fetch@latest';
-        window.x402Fetch = x402Fetch;
-      </script>
+      <script src="https://unpkg.com/@x402/paywall@latest/dist/paywall.min.js"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 480px; width: 100%; border: 1px solid #334155; }
@@ -60,15 +56,10 @@ app.get('/', (req, res) => {
           btn.disabled = true;
 
           try {
-            // Use x402Fetch if loaded to prompt wallet signature automatically
-            const fetchFn = window.x402Fetch || window.fetch;
-            const res = await fetchFn(endpoint);
-            
-            const data = await res.json();
-            statusDiv.innerText = "Success: " + JSON.stringify(data);
+            // Force browser navigation so mobile wallet dApp browser intercepts 402 header
+            window.location.href = endpoint;
           } catch (err) {
-            statusDiv.innerText = "Payment cancelled or failed.";
-          } finally {
+            statusDiv.innerText = "Payment failed or was cancelled.";
             btn.disabled = false;
           }
         }
