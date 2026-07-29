@@ -18,6 +18,8 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>AI Image Studio | x402 Micropayments</title>
+      <!-- Inject x402 Paywall client SDK -->
+      <script src="https://unpkg.com/@x402/paywall@latest/dist/paywall.min.js"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 480px; width: 100%; border: 1px solid #334155; }
@@ -38,9 +40,16 @@ app.get('/', (req, res) => {
       </div>
 
       <script>
-        function generate() {
+        async function generate() {
           const prompt = encodeURIComponent(document.getElementById('prompt').value);
-          window.location.href = '/api/v1/generate-image?prompt=' + prompt;
+          const endpoint = '/api/v1/generate-image?prompt=' + prompt;
+
+          // Trigger x402 paywall client modal for wallet signature/payment
+          if (window.x402Paywall) {
+            await window.x402Paywall.fetch(endpoint);
+          } else {
+            window.location.href = endpoint;
+          }
         }
       </script>
     </body>
@@ -56,7 +65,7 @@ const facilitatorClient = new HTTPFacilitatorClient({
 const x402Server = new x402ResourceServer(facilitatorClient);
 x402Server.register('eip155:8453', new ExactEvmScheme());
 
-// 3. x402 Micropayment Protection
+// 3. x402 Micropayment Protection Route Config
 const routes = {
   'GET /api/v1/generate-image': {
     accepts: [
@@ -73,7 +82,7 @@ const routes = {
 
 app.use(paymentMiddleware(routes, x402Server));
 
-// 4. Protected Endpoint
+// 4. Protected Route
 app.get('/api/v1/generate-image', (req, res) => {
   res.json({
     success: true,
