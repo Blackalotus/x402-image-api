@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Direct EIP-712 eth_signTypedData_v4 Call
+// 1. Human UI Homepage Route with Guaranteed Phantom EVM Trigger
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -55,74 +55,54 @@ app.get('/', (req, res) => {
 
           if (!window.ethereum) {
             statusDiv.className = "error";
-            statusDiv.innerText = "Please open inside Phantom, Coinbase Wallet, or Rainbow mobile dApp browser.";
+            statusDiv.innerText = "No Web3 browser wallet detected. Open in Phantom, Coinbase Wallet, or Rainbow.";
             return;
           }
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
           statusDiv.className = "";
-          statusDiv.innerText = "1/2 Connecting wallet...";
+          statusDiv.innerText = "1/3 Connecting wallet & switching to Base...";
           btn.disabled = true;
 
           try {
+            // Request accounts
             const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
             const fromAddress = accounts[0];
 
-            statusDiv.innerText = "2/2 Sign $0.05 Base USDC Authorization in wallet...";
+            // Force wallet to Base Mainnet (Chain ID 0x2105 = 8453)
+            try {
+              await window.ethereum.request({
+                method: 'wallet_switchEthereumChain',
+                params: [{ chainId: '0x2105' }],
+              });
+            } catch (switchError) {
+              // Ignore if wallet is already on Base or doesn't throw
+            }
+
+            statusDiv.innerText = "2/3 Confirming authorization signature in wallet...";
 
             const now = Math.floor(Date.now() / 1000);
-            
-            // Build random 32-byte hex nonce
-            const array = new Uint8Array(32);
-            window.crypto.getRandomValues(array);
-            const nonce = '0x' + Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
+            const messageToSign = "Authorize x402 Micropayment: $0.05 Base USDC to ${WALLET_ADDRESS} | Timestamp: " + now;
 
-            const typedData = {
-              domain: {
-                name: 'USD Coin',
-                version: '2',
-                chainId: 8453,
-                verifyingContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
-              },
-              types: {
-                EIP712Domain: [
-                  { name: 'name', type: 'string' },
-                  { name: 'version', type: 'string' },
-                  { name: 'chainId', type: 'uint256' },
-                  { name: 'verifyingContract', type: 'address' }
-                ],
-                TransferWithAuthorization: [
-                  { name: 'from', type: 'address' },
-                  { name: 'to', type: 'address' },
-                  { name: 'value', type: 'uint256' },
-                  { name: 'validAfter', type: 'uint256' },
-                  { name: 'validBefore', type: 'uint256' },
-                  { name: 'nonce', type: 'bytes32' }
-                ]
-              },
-              primaryType: 'TransferWithAuthorization',
-              message: {
-                from: fromAddress,
-                to: '${WALLET_ADDRESS}',
-                value: '50000',
-                validAfter: '0',
-                validBefore: String(now + 3600),
-                nonce: nonce
-              }
-            };
-
-            // Call native RPC directly to force wallet UI popup
+            // Trigger universal personal_sign supported across Phantom, Coinbase, Rainbow, MetaMask
             const signature = await window.ethereum.request({
-              method: 'eth_signTypedData_v4',
-              params: [fromAddress, JSON.stringify(typedData)]
+              method: 'personal_sign',
+              params: [messageToSign, fromAddress],
             });
+
+            statusDiv.innerText = "3/3 Verifying micropayment with server...";
 
             const paymentHeaderPayload = btoa(JSON.stringify({
               scheme: 'exact',
               network: 'eip155:8453',
               payload: {
                 signature: signature,
-                authorization: typedData.message
+                authorization: {
+                  from: fromAddress,
+                  to: '${WALLET_ADDRESS}',
+                  value: '50000',
+                  message: messageToSign
+                }
               }
             }));
 
@@ -133,7 +113,7 @@ app.get('/', (req, res) => {
             });
 
             if (!response.ok) {
-              throw new Error("HTTP " + response.status + ": Verification Failed");
+              throw new Error("HTTP " + response.status + ": Micropayment authorization check failed.");
             }
 
             const data = await response.json();
