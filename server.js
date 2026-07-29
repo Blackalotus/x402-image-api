@@ -49,18 +49,19 @@ app.get('/', (req, res) => {
 });
 
 // 2. x402 Micropayment Protection
-const x402Server = new x402ResourceServer({
-  payTo: WALLET_ADDRESS,
-  routes: {
-    'GET /api/v1/generate-image': {
-      price: '$0.05',
-      network: 'base',
-      resource: 'https://x402-image-api.onrender.com/api/v1/generate-image'
-    }
+const routes = {
+  'GET /api/v1/generate-image': {
+    price: '$0.05',
+    network: 'base',
+    payTo: WALLET_ADDRESS,
+    resource: 'https://x402-image-api.onrender.com/api/v1/generate-image'
   }
-});
+};
 
-app.use(paymentMiddleware(x402Server));
+const x402Server = new x402ResourceServer();
+
+app.use(paymentMiddleware(routes, x402Server));
+
 
 
 // 3. Protected Route
