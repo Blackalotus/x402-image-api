@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route
+// 1. Human UI Homepage Route with Embedded Wallet Paywall Handler
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -18,8 +18,7 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>AI Image Studio | x402 Micropayments</title>
-      <!-- Inject x402 Paywall client SDK -->
-      <script src="https://unpkg.com/@x402/paywall@latest/dist/paywall.min.js"></script>
+      <script src="https://cdn.jsdelivr.net/npm/@x402/paywall@latest/dist/paywall.min.js"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 480px; width: 100%; border: 1px solid #334155; }
@@ -29,6 +28,7 @@ app.get('/', (req, res) => {
         input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; margin-bottom: 1rem; box-sizing: border-box; }
         button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-weight: bold; cursor: pointer; transition: 0.2s; }
         button:hover { background: #1d4ed8; }
+        #result { margin-top: 1rem; word-break: break-all; color: #38bdf8; font-size: 0.85rem; }
       </style>
     </head>
     <body>
@@ -37,18 +37,23 @@ app.get('/', (req, res) => {
         <p>Enter a prompt below. Payment of $0.05 Base USDC will be prompted via your connected wallet.</p>
         <input type="text" id="prompt" placeholder="e.g. Cyberpunk city in neon rain..." value="Cyberpunk city in neon rain">
         <button onclick="generate()">Generate Image ($0.05 Base USDC)</button>
+        <div id="result"></div>
       </div>
 
       <script>
         async function generate() {
           const prompt = encodeURIComponent(document.getElementById('prompt').value);
           const endpoint = '/api/v1/generate-image?prompt=' + prompt;
+          const resultDiv = document.getElementById('result');
+          resultDiv.innerText = "Requesting payment from wallet...";
 
-          // Trigger x402 paywall client modal for wallet signature/payment
-          if (window.x402Paywall) {
-            await window.x402Paywall.fetch(endpoint);
-          } else {
-            window.location.href = endpoint;
+          try {
+            // Fetch via JS fetch so 402 is handled in-browser by paywall SDK or intercepted
+            const response = await fetch(endpoint);
+            const data = await response.json();
+            resultDiv.innerText = JSON.stringify(data, null, 2);
+          } catch (err) {
+            resultDiv.innerText = "Payment required or cancelled.";
           }
         }
       </script>
@@ -65,7 +70,7 @@ const facilitatorClient = new HTTPFacilitatorClient({
 const x402Server = new x402ResourceServer(facilitatorClient);
 x402Server.register('eip155:8453', new ExactEvmScheme());
 
-// 3. x402 Micropayment Protection Route Config
+// 3. x402 Micropayment Protection
 const routes = {
   'GET /api/v1/generate-image': {
     accepts: [
