@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Client Paywall Auto-Trigger
+// 1. Human UI Homepage Route
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -18,7 +18,6 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>AI Image Studio | x402 Micropayments</title>
-      <script src="https://cdn.jsdelivr.net/npm/@x402/paywall@latest/dist/paywall.min.js"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 480px; width: 100%; border: 1px solid #334155; }
@@ -28,45 +27,44 @@ app.get('/', (req, res) => {
         input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; margin-bottom: 1rem; box-sizing: border-box; }
         button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-weight: bold; cursor: pointer; transition: 0.2s; }
         button:hover { background: #1d4ed8; }
-        #result { margin-top: 1rem; word-break: break-all; color: #38bdf8; font-size: 0.85rem; font-weight: 500; }
+        #status { margin-top: 1rem; font-size: 0.85rem; color: #38bdf8; word-break: break-all; }
       </style>
     </head>
     <body>
       <div class="card">
         <h1>AI Image Generator <span class="badge">x402 Active</span></h1>
         <p>Enter a prompt below. Payment of $0.05 Base USDC will be prompted via your connected wallet.</p>
-        <input type="text" id="prompt" placeholder="e.g. Cyberpunk city in neon rain..." value="Cyberpunk city in neon rain">
+        <input type="text" id="prompt" placeholder="Type your prompt here..." value="" />
         <button id="btn" onclick="generate()">Generate Image ($0.05 Base USDC)</button>
-        <div id="result"></div>
+        <div id="status"></div>
       </div>
 
       <script>
         async function generate() {
-          const prompt = encodeURIComponent(document.getElementById('prompt').value);
-          const endpoint = '/api/v1/generate-image?prompt=' + prompt;
-          const resultDiv = document.getElementById('result');
+          const promptInput = document.getElementById('prompt').value.trim();
+          const statusDiv = document.getElementById('status');
           const btn = document.getElementById('btn');
 
-          resultDiv.innerText = "Connecting wallet & requesting payment...";
+          if (!promptInput) {
+            statusDiv.innerText = "Please enter a prompt first.";
+            return;
+          }
+
+          const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
+          statusDiv.innerText = "Processing request...";
           btn.disabled = true;
 
           try {
-            // Use x402Paywall wrapper if loaded, otherwise fallback to paywall fetch
-            let response;
-            if (window.x402 && window.x402.fetch) {
-              response = await window.x402.fetch(endpoint);
-            } else if (window.x402Paywall) {
-              response = await window.x402Paywall.fetch(endpoint);
+            const res = await fetch(endpoint);
+            if (res.status === 402) {
+              const payData = await res.json();
+              statusDiv.innerText = "Payment Required ($0.05 USDC). Please approve in wallet.";
             } else {
-              // Redirect directly to the route so browser wallet extension or mobile app handles 402
-              window.location.href = endpoint;
-              return;
+              const data = await res.json();
+              statusDiv.innerText = "Success: " + JSON.stringify(data);
             }
-
-            const data = await response.json();
-            resultDiv.innerText = "Success! " + JSON.stringify(data);
           } catch (err) {
-            resultDiv.innerText = "Payment failed or was cancelled.";
+            statusDiv.innerText = "Error completing request.";
           } finally {
             btn.disabled = false;
           }
