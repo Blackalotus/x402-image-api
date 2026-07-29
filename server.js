@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Official x402 Paywall Modal
+// 1. Human UI Homepage Route with Error Debugging
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -29,6 +29,7 @@ app.get('/', (req, res) => {
         button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-weight: bold; cursor: pointer; transition: 0.2s; }
         button:hover { background: #1d4ed8; }
         #status { margin-top: 1rem; font-size: 0.85rem; color: #38bdf8; word-break: break-all; }
+        .error { color: #ef4444 !important; font-weight: bold; }
       </style>
     </head>
     <body>
@@ -53,15 +54,35 @@ app.get('/', (req, res) => {
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
           statusDiv.innerText = "Connecting to wallet...";
+          statusDiv.className = "";
           btn.disabled = true;
 
           try {
-            // x402Paywall wraps window.fetch to capture 402 responses and display the wallet UI overlay
-            const response = await window.x402Paywall.fetch(endpoint);
+            let fetchFn = window.fetch;
+            
+            // Check which x402 global the CDN actually loaded
+            if (window.x402Paywall && window.x402Paywall.fetch) {
+              fetchFn = window.x402Paywall.fetch.bind(window.x402Paywall);
+            } else if (window.x402 && window.x402.fetch) {
+              fetchFn = window.x402.fetch.bind(window.x402);
+            } else {
+              throw new Error("x402 Paywall SDK is not loaded. Check CDN link or browser blockers.");
+            }
+
+            const response = await fetchFn(endpoint);
+            
+            if (response.status === 402) {
+              throw new Error("Wallet failed to intercept the 402 Payment Required request.");
+            }
+            if (!response.ok) {
+              throw new Error("HTTP Error: " + response.status);
+            }
+
             const data = await response.json();
             statusDiv.innerText = "Access Granted! Result: " + JSON.stringify(data);
           } catch (err) {
-            statusDiv.innerText = "Payment canceled or failed.";
+            statusDiv.innerText = "Error: " + err.message;
+            statusDiv.className = "error";
           } finally {
             btn.disabled = false;
           }
