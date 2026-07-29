@@ -1,5 +1,6 @@
 import express from 'express';
 import { paymentMiddleware, x402ResourceServer } from '@x402/express';
+import { HTTPFacilitatorClient } from '@x402/core/server';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
 
 const app = express();
@@ -47,17 +48,21 @@ app.get('/', (req, res) => {
   `);
 });
 
-// 2. Initialize x402 Server & EVM Scheme
-const x402Server = new x402ResourceServer();
+// 2. Configure Facilitator Client & x402 Server
+const facilitatorClient = new HTTPFacilitatorClient({
+  url: 'https://x402.org/facilitator',
+});
+
+const x402Server = new x402ResourceServer(facilitatorClient);
 x402Server.register('eip155:8453', new ExactEvmScheme());
 
-// 3. x402 Micropayment Protection
+// 3. x402 Micropayment Protection Route Config
 const routes = {
   'GET /api/v1/generate-image': {
     accepts: [
       {
         scheme: 'exact',
-        price: '0.05',
+        price: '$0.05',
         network: 'eip155:8453',
         payTo: WALLET_ADDRESS,
       }
