@@ -2,6 +2,7 @@ import express from 'express';
 import { paymentMiddleware } from 'x402-express';
 
 const app = express();
+app.set('trust proxy', true); 
 app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
