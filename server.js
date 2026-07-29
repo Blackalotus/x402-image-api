@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with x402 Client SDK
+// 1. Human UI Homepage Route with Native EIP-712 Web3 Connector
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -55,25 +55,21 @@ app.get('/', (req, res) => {
 
           if (!window.ethereum) {
             statusDiv.className = "error";
-            statusDiv.innerText = "No Web3 browser wallet detected. Open in MetaMask, Coinbase Wallet, or Phantom.";
+            statusDiv.innerText = "No Web3 wallet detected. Open in MetaMask, Coinbase Wallet, or Phantom.";
             return;
           }
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
           statusDiv.className = "";
-          statusDiv.innerText = "1/3 Loading x402 protocol client...";
+          statusDiv.innerText = "1/3 Connecting wallet & checking network...";
           btn.disabled = true;
 
           try {
-            // Import SDK modules dynamically via ESM
-            const { x402Client } = await import('https://esm.sh/@x402/client@latest');
-            const { ExactEvmScheme } = await import('https://esm.sh/@x402/evm@latest/exact/client');
-
-            // Connect wallet
+            // Request Wallet Connection
             const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
             const userAddress = accounts[0];
 
-            // Ensure network is Base Mainnet
+            // Switch to Base Mainnet (0x2105 = 8453)
             try {
               await window.ethereum.request({
                 method: 'wallet_switchEthereumChain',
@@ -81,24 +77,80 @@ app.get('/', (req, res) => {
               });
             } catch (e) {}
 
-            statusDiv.innerText = "2/3 Prompting $0.05 Base USDC permit in wallet...";
+            statusDiv.innerText = "2/3 Confirming $0.05 Base USDC Authorization in wallet...";
 
-            // Signer callback using EIP-712 eth_signTypedData_v4
-            const signer = async (typedData) => {
-              return await window.ethereum.request({
-                method: 'eth_signTypedData_v4',
-                params: [userAddress, JSON.stringify(typedData)]
-              });
+            const now = Math.floor(Date.now() / 1000);
+            
+            // Generate 32-byte hex nonce
+            const array = new Uint8Array(32);
+            window.crypto.getRandomValues(array);
+            const nonce = '0x' + Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
+
+            const authorizationMsg = {
+              from: userAddress,
+              to: '${WALLET_ADDRESS}',
+              value: '50000', // $0.05 USDC (6 decimals)
+              validAfter: '0',
+              validBefore: String(now + 3600),
+              nonce: nonce
             };
 
-            const client = new x402Client();
-            client.register('eip155:8453', new ExactEvmScheme(signer));
+            const typedData = {
+              domain: {
+                name: 'USD Coin',
+                version: '2',
+                chainId: 8453,
+                verifyingContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+              },
+              types: {
+                EIP712Domain: [
+                  { name: 'name', type: 'string' },
+                  { name: 'version', type: 'string' },
+                  { name: 'chainId', type: 'uint256' },
+                  { name: 'verifyingContract', type: 'address' }
+                ],
+                TransferWithAuthorization: [
+                  { name: 'from', type: 'address' },
+                  { name: 'to', type: 'address' },
+                  { name: 'value', type: 'uint256' },
+                  { name: 'validAfter', type: 'uint256' },
+                  { name: 'validBefore', type: 'uint256' },
+                  { name: 'nonce', type: 'bytes32' }
+                ]
+              },
+              primaryType: 'TransferWithAuthorization',
+              message: authorizationMsg
+            };
 
-            // Perform 402 fetch & handle signed payload construction automatically
-            const response = await client.fetch(endpoint);
+            // Request wallet signature
+            const signature = await window.ethereum.request({
+              method: 'eth_signTypedData_v4',
+              params: [userAddress, JSON.stringify(typedData)]
+            });
+
+            statusDiv.innerText = "3/3 Verifying micropayment with server...";
+
+            // Build official x402 v2 payment payload
+            const x402Payload = {
+              x402Version: '2.0.0',
+              scheme: 'exact',
+              network: 'eip155:8453',
+              payload: {
+                signature: signature,
+                authorization: authorizationMsg
+              }
+            };
+
+            const paymentHeader = btoa(JSON.stringify(x402Payload));
+
+            const response = await fetch(endpoint, {
+              headers: {
+                'X-PAYMENT': paymentHeader
+              }
+            });
 
             if (!response.ok) {
-              throw new Error("HTTP " + response.status + ": Authorization failed");
+              throw new Error("HTTP " + response.status + ": Verification Failed");
             }
 
             const data = await response.json();
