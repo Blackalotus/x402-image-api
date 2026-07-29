@@ -48,15 +48,15 @@ app.get('/', (req, res) => {
   `);
 });
 
-// 2. Configure Facilitator Client & x402 Server
+// 2. Initialize Active Facilitator & Resource Server
 const facilitatorClient = new HTTPFacilitatorClient({
-  url: 'https://x402.org/facilitator',
+  url: 'https://facilitator.payai.network',
 });
 
 const x402Server = new x402ResourceServer(facilitatorClient);
 x402Server.register('eip155:8453', new ExactEvmScheme());
 
-// 3. x402 Micropayment Protection Route Config
+// 3. x402 Micropayment Protection
 const routes = {
   'GET /api/v1/generate-image': {
     accepts: [
@@ -73,7 +73,7 @@ const routes = {
 
 app.use(paymentMiddleware(routes, x402Server));
 
-// 4. Protected Route
+// 4. Protected Endpoint
 app.get('/api/v1/generate-image', (req, res) => {
   res.json({
     success: true,
