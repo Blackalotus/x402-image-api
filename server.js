@@ -50,10 +50,11 @@ app.get('/', (req, res) => {
 
 // 2. x402 Micropayment Protection
 app.use(
-  paymentMiddleware(WALLET_ADDRESS, {
+  paymentMiddleware( {
     'GET /api/v1/generate-image': {
       price: '$0.05',
       network: 'base',
+      payTo: WALLET_ADDRESS,
       resource: 'https://x402-image-api.onrender.com/api/v1/generate-image'
     }
   })
