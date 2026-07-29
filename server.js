@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Native EIP-712 Web3 Connector
+// 1. Human UI Homepage Route
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -89,7 +89,7 @@ app.get('/', (req, res) => {
             const authorizationMsg = {
               from: userAddress,
               to: '${WALLET_ADDRESS}',
-              value: '50000', // $0.05 USDC (6 decimals)
+              value: '50000', // $0.05 USDC in 6 decimal atomic units
               validAfter: '0',
               validBefore: String(now + 3600),
               nonce: nonce
@@ -122,7 +122,7 @@ app.get('/', (req, res) => {
               message: authorizationMsg
             };
 
-            // Request wallet signature
+            // Request wallet EIP-712 signature
             const signature = await window.ethereum.request({
               method: 'eth_signTypedData_v4',
               params: [userAddress, JSON.stringify(typedData)]
@@ -130,9 +130,9 @@ app.get('/', (req, res) => {
 
             statusDiv.innerText = "3/3 Verifying micropayment with server...";
 
-            // Build official x402 v2 payment payload
+            // Construct standard x402 payment payload
             const x402Payload = {
-              x402Version: '2.0.0',
+              x402Version: 2,
               scheme: 'exact',
               network: 'eip155:8453',
               payload: {
@@ -171,7 +171,7 @@ app.get('/', (req, res) => {
 
 // 2. Initialize Facilitator & x402 Resource Server
 const facilitatorClient = new HTTPFacilitatorClient({
-  url: 'https://facilitator.payai.network',
+  url: 'https://x402.org/facilitator',
 });
 
 const x402Server = new x402ResourceServer(facilitatorClient);
