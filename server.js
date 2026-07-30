@@ -9,6 +9,7 @@ import {
   declareDiscoveryExtension,
   withBazaar
 } from '@x402/extensions/bazaar';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 
 const app = express();
 app.set('trust proxy', true);
@@ -23,26 +24,108 @@ const REPLICATE_MODEL = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-s
 const CDP_KEY_ID = process.env.CDP_API_KEY_ID;
 const CDP_KEY_SECRET = process.env.CDP_API_KEY_SECRET;
 
-// ---------------------------------------------------------------------------
-// In-memory image cache so a paid result can be re-fetched as real bytes.
-// Gives humans a working download and agents a plain URL. Not durable — a
-// Render restart clears it, so move to S3/R2 if you need permanence.
-// ---------------------------------------------------------------------------
-const IMAGE_TTL_MS = 60 * 60 * 1000;
-const IMAGE_CACHE_MAX = 50;
-const imageCache = new Map();
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET = process.env.R2_BUCKET || 'x402-images';
+const RETENTION_DAYS = Number(process.env.IMAGE_RETENTION_DAYS || 30);
 
-function cacheImage({ buffer, mimeType, prompt }) {
+// ---------------------------------------------------------------------------
+// Storage. R2 is the durable store; a small in-process LRU sits in front so
+// repeat views of a fresh image don't round-trip to object storage.
+//
+// If R2 isn't configured the server still works, but images live only in
+// memory and die on restart — fine for local dev, not for handing out links.
+// ---------------------------------------------------------------------------
+const r2Enabled = Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY);
+
+const r2 = r2Enabled
+  ? new S3Client({
+      region: 'auto',
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY
+      }
+    })
+  : null;
+
+if (!r2Enabled) {
+  console.warn('[storage] R2 not configured — image URLs will break on restart. Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.');
+}
+
+const HOT_CACHE_MAX = 30;
+const hotCache = new Map();
+
+function hotSet(id, entry) {
+  hotCache.set(id, entry);
+  while (hotCache.size > HOT_CACHE_MAX) {
+    hotCache.delete(hotCache.keys().next().value);
+  }
+}
+
+function extFor(mimeType) {
+  return (mimeType || 'image/webp').split('/')[1] || 'webp';
+}
+
+function slugify(text) {
+  return (text || 'image').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'image';
+}
+
+async function storeImage({ buffer, mimeType, prompt }) {
   const id = crypto.randomBytes(16).toString('hex');
-  imageCache.set(id, { buffer, mimeType, prompt, createdAt: Date.now() });
+  const key = `images/${id}.${extFor(mimeType)}`;
 
-  for (const [key, value] of imageCache) {
-    if (Date.now() - value.createdAt > IMAGE_TTL_MS) imageCache.delete(key);
+  if (r2) {
+    await r2.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      Body: buffer,
+      ContentType: mimeType,
+      // R2 object metadata must be ASCII; prompts can contain anything.
+      Metadata: { prompt: encodeURIComponent(prompt).slice(0, 1800) }
+    }));
   }
-  while (imageCache.size > IMAGE_CACHE_MAX) {
-    imageCache.delete(imageCache.keys().next().value);
+
+  hotSet(id, { buffer, mimeType, prompt, key });
+  return { id, key };
+}
+
+async function loadImage(id) {
+  const hot = hotCache.get(id);
+  if (hot) return hot;
+  if (!r2) return null;
+
+  // The id alone doesn't encode the extension, so try the plausible ones.
+  for (const ext of ['webp', 'png', 'jpeg', 'jpg']) {
+    try {
+      const result = await r2.send(new GetObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: `images/${id}.${ext}`
+      }));
+
+      const bytes = await result.Body.transformToByteArray();
+      const entry = {
+        buffer: Buffer.from(bytes),
+        mimeType: result.ContentType || `image/${ext}`,
+        prompt: result.Metadata && result.Metadata.prompt
+          ? decodeURIComponent(result.Metadata.prompt)
+          : 'image',
+        key: `images/${id}.${ext}`
+      };
+      hotSet(id, entry);
+      return entry;
+    } catch (err) {
+      const notFound = err.name === 'NoSuchKey' ||
+        (err.$metadata && err.$metadata.httpStatusCode === 404);
+      if (!notFound) {
+        console.error('[storage] R2 read error:', err.name, err.message);
+        return null;
+      }
+    }
   }
-  return id;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +237,7 @@ app.get('/', (req, res) => {
         }
 
         function openInTab() {
-          if (!lastResult) return;
+          if (!lastResult || !lastResult.imageUrl) return;
           window.open(lastResult.imageUrl, '_blank');
           toast('Opened full size — long-press it and choose "Add to Photos"');
         }
@@ -227,10 +310,12 @@ app.get('/', (req, res) => {
 
         async function copyLink() {
           if (!lastResult) return;
-          const link = window.location.origin + lastResult.imageUrl;
+          const link = lastResult.absoluteUrl ||
+            (lastResult.imageUrl ? window.location.origin + lastResult.imageUrl : null);
+          if (!link) return toast('No stored URL for this image', true);
           try {
             await navigator.clipboard.writeText(link);
-            toast('Link copied — valid for 1 hour');
+            toast('Link copied');
           } catch (err) {
             toast('Could not copy: ' + link, true);
           }
@@ -433,7 +518,8 @@ app.get('/', (req, res) => {
 
             const tx = settlement && settlement.transaction;
             metaEl.innerHTML = 'Prompt: ' + (data.prompt || '') + '<br>Model: ' + (data.model || '') +
-              (tx ? '<br>Tx: <a href="https://basescan.org/tx/' + tx + '" target="_blank" rel="noopener">' + tx + '</a>' : '');
+              (tx ? '<br>Tx: <a href="https://basescan.org/tx/' + tx + '" target="_blank" rel="noopener">' + tx + '</a>' : '') +
+              (data.storageWarning ? '<br>Note: ' + data.storageWarning : '');
             resultDiv.style.display = 'block';
 
             statusDiv.className = 'success';
@@ -457,8 +543,7 @@ app.get('/', (req, res) => {
 //    Bazaar indexing only happens when the CDP facilitator settles a payment
 //    for a route that declares discovery metadata. Settling through any other
 //    facilitator means Coinbase never sees the traffic and the service never
-//    appears on agentic.market. withBazaar() adds catalog query support on top
-//    of the normal verify/settle client.
+//    appears on agentic.market.
 // ---------------------------------------------------------------------------
 const usingCdp = Boolean(CDP_KEY_ID && CDP_KEY_SECRET);
 
@@ -485,20 +570,26 @@ if (usingCdp) {
 //    already-paid-for image can be fetched again without paying twice.
 //    The 128-bit random id is the access credential.
 // ---------------------------------------------------------------------------
-app.get('/api/v1/image/:id', (req, res) => {
-  const entry = imageCache.get(req.params.id);
-  if (!entry || Date.now() - entry.createdAt > IMAGE_TTL_MS) {
-    imageCache.delete(req.params.id);
-    return res.status(404).json({ error: 'Image expired or not found. Images are kept for 1 hour.' });
+app.get('/api/v1/image/:id', async (req, res) => {
+  if (!/^[a-f0-9]{32}$/.test(req.params.id)) {
+    return res.status(400).json({ error: 'Malformed image id' });
   }
 
-  const ext = entry.mimeType.split('/')[1] || 'webp';
+  let entry;
+  try {
+    entry = await loadImage(req.params.id);
+  } catch (err) {
+    console.error('[storage] load failed:', err);
+    return res.status(500).json({ error: 'Storage error' });
+  }
+
+  if (!entry) return res.status(404).json({ error: 'Image not found' });
+
   res.set('Content-Type', entry.mimeType);
-  res.set('Cache-Control', 'private, max-age=3600');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
   if (req.query.download !== undefined) {
-    const slug = (entry.prompt || 'image').toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-    res.set('Content-Disposition', `attachment; filename="${slug || 'image'}.${ext}"`);
+    res.set('Content-Disposition',
+      `attachment; filename="${slugify(entry.prompt)}.${extFor(entry.mimeType)}"`);
   }
   res.send(entry.buffer);
 });
@@ -536,7 +627,7 @@ const discovery = declareDiscoveryExtension({
       format: {
         type: 'string',
         enum: ['json', 'binary'],
-        description: 'json returns base64 plus a retrieval URL; binary returns raw image bytes'
+        description: 'json returns base64 plus a durable URL; binary returns raw image bytes'
       }
     },
     required: ['prompt']
@@ -548,8 +639,7 @@ const discovery = declareDiscoveryExtension({
       model: 'black-forest-labs/flux-schnell',
       mimeType: 'image/webp',
       image: '<base64-encoded image bytes>',
-      absoluteUrl: `${BASE_URL}/api/v1/image/9f2c...`,
-      expiresInSeconds: 3600
+      absoluteUrl: `${BASE_URL}/api/v1/image/9f2c4a1e7b3d5f8091a2b3c4d5e6f708`
     },
     schema: {
       properties: {
@@ -558,9 +648,9 @@ const discovery = declareDiscoveryExtension({
         model: { type: 'string' },
         mimeType: { type: 'string' },
         image: { type: 'string', description: 'Base64-encoded image' },
-        absoluteUrl: { type: 'string', description: 'Direct image URL, valid 1 hour' },
+        absoluteUrl: { type: 'string', description: 'Durable image URL' },
         downloadUrl: { type: 'string' },
-        expiresInSeconds: { type: 'number' }
+        retentionDays: { type: 'number' }
       }
     }
   }
@@ -578,7 +668,7 @@ const routes = {
     ],
     description:
       'Text-to-image generation powered by FLUX. Send a prompt, get back a 1024x1024 image as ' +
-      'base64 JSON or raw bytes, plus a direct URL valid for one hour. No API key or account needed.',
+      'base64 JSON or raw bytes, plus a durable direct URL. No API key or account needed.',
     mimeType: 'application/json',
     extensions: { ...discovery }
   }
@@ -657,26 +747,43 @@ app.get('/api/v1/generate-image', async (req, res) => {
   try {
     console.log(`[gen] generating: "${prompt}"`);
     const { buffer, mimeType } = await replicateGenerate(prompt);
-    const id = cacheImage({ buffer, mimeType, prompt });
-    console.log(`[gen] done: ${id}, ${Math.round(buffer.length / 1024)} KB`);
+
+    // Store before responding, but never fail the request over it — the caller
+    // has already paid, so they get their image inline either way. Only the
+    // durable URL is lost if the upload fails.
+    let id = null;
+    try {
+      const stored = await storeImage({ buffer, mimeType, prompt });
+      id = stored.id;
+      console.log(`[gen] stored ${id}, ${Math.round(buffer.length / 1024)} KB`);
+    } catch (storageErr) {
+      console.error('[storage] upload failed, serving inline only:', storageErr);
+    }
 
     if (req.query.format === 'binary') {
       res.set('Content-Type', mimeType);
-      res.set('X-Image-Url', `${BASE_URL}/api/v1/image/${id}`);
+      if (id) res.set('X-Image-Url', `${BASE_URL}/api/v1/image/${id}`);
       return res.send(buffer);
     }
 
-    res.json({
+    const payload = {
       success: true,
       prompt,
       model: REPLICATE_MODEL,
       mimeType,
-      image: buffer.toString('base64'),
-      imageUrl: `/api/v1/image/${id}`,
-      absoluteUrl: `${BASE_URL}/api/v1/image/${id}`,
-      downloadUrl: `${BASE_URL}/api/v1/image/${id}?download=1`,
-      expiresInSeconds: IMAGE_TTL_MS / 1000
-    });
+      image: buffer.toString('base64')
+    };
+
+    if (id) {
+      payload.imageUrl = `/api/v1/image/${id}`;
+      payload.absoluteUrl = `${BASE_URL}/api/v1/image/${id}`;
+      payload.downloadUrl = `${BASE_URL}/api/v1/image/${id}?download=1`;
+      payload.retentionDays = RETENTION_DAYS;
+    } else {
+      payload.storageWarning = 'Image generated but not persisted; use the inline base64.';
+    }
+
+    res.json(payload);
   } catch (err) {
     console.error('[gen] FAILED AFTER PAYMENT:', prompt, err);
     res.status(502).json({
@@ -695,7 +802,10 @@ app.get('/healthz', (req, res) =>
     payTo: WALLET_ADDRESS,
     replicate: Boolean(REPLICATE_TOKEN),
     model: REPLICATE_MODEL,
-    cachedImages: imageCache.size
+    storage: r2Enabled ? 'r2' : 'memory-only',
+    bucket: r2Enabled ? R2_BUCKET : null,
+    retentionDays: RETENTION_DAYS,
+    hotCache: hotCache.size
   })
 );
 
@@ -706,6 +816,7 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 10000;
 const facilitatorLabel = usingCdp ? 'CDP (Bazaar on)' : 'PayAI (Bazaar off)';
+const storageLabel = r2Enabled ? 'R2' : 'memory-only';
 app.listen(PORT, function () {
-  console.log('Server on port ' + PORT + ' - facilitator: ' + facilitatorLabel);
+  console.log('Server on port ' + PORT + ' - facilitator: ' + facilitatorLabel + ', storage: ' + storageLabel);
 });
