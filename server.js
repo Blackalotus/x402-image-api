@@ -93,6 +93,8 @@ app.get('/', (req, res) => {
 
       <script>
         let lastResult = null;
+        let pngPromise = null;
+        let clipboardBlocked = false;
 
         function randomNonce() {
           const bytes = new Uint8Array(32);
@@ -116,30 +118,54 @@ app.get('/', (req, res) => {
           setTimeout(() => { if (el.innerText === msg) el.innerText = ''; }, 3000);
         }
 
-        // Clipboard image support is PNG-only in most browsers, and the model
-        // returns webp — so redraw through a canvas before copying.
-        async function copyImage() {
-          if (!lastResult) return;
-          try {
-            if (!navigator.clipboard || !window.ClipboardItem) {
-              throw new Error('Clipboard images unsupported here — use Save instead');
-            }
-            const img = document.getElementById('image');
-            await img.decode();
-
+        // The clipboard API only accepts PNG, and the model returns webp — so
+        // redraw through a canvas. Done eagerly on load, because Safari kills
+        // the click's user activation if we await anything before write().
+        function preparePng() {
+          const img = document.getElementById('image');
+          pngPromise = img.decode().then(() => {
             const canvas = document.createElement('canvas');
             canvas.width = img.naturalWidth;
             canvas.height = img.naturalHeight;
             canvas.getContext('2d').drawImage(img, 0, 0);
-
-            const blob = await new Promise((resolve, reject) =>
-              canvas.toBlob(b => (b ? resolve(b) : reject(new Error('Canvas encode failed'))), 'image/png')
+            return new Promise((resolve, reject) =>
+              canvas.toBlob(b => (b ? resolve(b) : reject(new Error('encode failed'))), 'image/png')
             );
+          });
+        }
 
-            await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-            toast('Image copied to clipboard');
+        function copyImage() {
+          if (!pngPromise) return;
+          const btn = document.getElementById('copyImgBtn');
+
+          if (clipboardBlocked || !navigator.clipboard || !window.ClipboardItem) {
+            return shareImage();
+          }
+
+          // Synchronous call inside the click. Handing ClipboardItem a promise
+          // rather than an awaited blob preserves transient user activation.
+          navigator.clipboard.write([new ClipboardItem({ 'image/png': pngPromise })])
+            .then(() => toast('Image copied to clipboard'))
+            .catch(() => {
+              clipboardBlocked = true;
+              btn.innerText = 'Share / Save image';
+              toast('Clipboard blocked here — tap again to share', true);
+            });
+        }
+
+        async function shareImage() {
+          try {
+            const blob = await pngPromise;
+            const slug = ((lastResult && lastResult.prompt) || 'image')
+              .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+            const file = new File([blob], (slug || 'image') + '.png', { type: 'image/png' });
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+              return await navigator.share({ files: [file] });
+            }
+            throw new Error('unsupported');
           } catch (err) {
-            toast(err.message || 'Copy failed — long-press the image to save', true);
+            if (err && err.name === 'AbortError') return;
+            toast('Use "Save image", or long-press the image above', true);
           }
         }
 
@@ -170,6 +196,12 @@ app.get('/', (req, res) => {
           statusDiv.className = '';
           resultDiv.style.display = 'none';
           btn.disabled = true;
+
+          // Reset per-run state so stale buttons can't act on an old image.
+          lastResult = null;
+          pngPromise = null;
+          clipboardBlocked = false;
+          document.getElementById('copyImgBtn').innerText = 'Copy image';
 
           try {
             // --- Step 1: unpaid request to receive the 402 challenge ----------
@@ -338,6 +370,7 @@ app.get('/', (req, res) => {
             const slug = promptInput.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
 
             imgEl.src = 'data:' + (data.mimeType || 'image/webp') + ';base64,' + data.image;
+            preparePng();
 
             // Download from the real endpoint, not the data URL — mobile
             // browsers handle Content-Disposition far better than data: links.
