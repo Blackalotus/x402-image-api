@@ -10,15 +10,17 @@ app.use(express.json());
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 const BASE_URL = process.env.BASE_URL || 'https://x402-image-api.onrender.com';
 
+const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
+const REPLICATE_MODEL = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell';
+
 // ---------------------------------------------------------------------------
 // 1. Human UI homepage
 //
 //    x402 V2 protocol notes baked into this client:
-//      - Requirements arrive in the base64 PAYMENT-REQUIRED response header
-//        (NOT the JSON body — that was the "accepts: []" failure).
-//      - The client retries with PAYMENT-SIGNATURE (NOT X-PAYMENT, which is V1).
-//      - The PaymentPayload must echo back an `accepted` object describing the
-//        requirement that was chosen, alongside payload.{signature,authorization}.
+//      - Requirements arrive in the base64 PAYMENT-REQUIRED response header.
+//      - The client retries with PAYMENT-SIGNATURE (X-PAYMENT is V1).
+//      - The PaymentPayload echoes back an `accepted` object plus
+//        payload.{signature, authorization}.
 //      - Settlement result comes back in the PAYMENT-RESPONSE header.
 // ---------------------------------------------------------------------------
 app.get('/', (req, res) => {
@@ -42,6 +44,10 @@ app.get('/', (req, res) => {
         #status { margin-top: 1rem; font-size: 0.85rem; color: #38bdf8; word-break: break-all; white-space: pre-wrap; }
         .error { color: #ef4444 !important; font-weight: bold; }
         .success { color: #4ade80 !important; font-weight: bold; }
+        #result { margin-top: 1.25rem; display: none; }
+        #result img { width: 100%; border-radius: 10px; border: 1px solid #334155; display: block; }
+        #meta { margin-top: 0.75rem; font-size: 0.75rem; color: #64748b; word-break: break-all; }
+        #meta a { color: #38bdf8; }
       </style>
     </head>
     <body>
@@ -51,6 +57,10 @@ app.get('/', (req, res) => {
         <input type="text" id="prompt" placeholder="Type your prompt here..." value="" />
         <button id="btn" onclick="generate()">Generate Image ($0.05 Base USDC)</button>
         <div id="status"></div>
+        <div id="result">
+          <img id="image" alt="Generated image" />
+          <div id="meta"></div>
+        </div>
       </div>
 
       <script>
@@ -76,6 +86,9 @@ app.get('/', (req, res) => {
           const promptInput = document.getElementById('prompt').value.trim();
           const statusDiv = document.getElementById('status');
           const btn = document.getElementById('btn');
+          const resultDiv = document.getElementById('result');
+          const imgEl = document.getElementById('image');
+          const metaEl = document.getElementById('meta');
           const fail = (msg) => { statusDiv.className = 'error'; statusDiv.innerText = msg; };
 
           if (!promptInput) return fail('Please enter a prompt first.');
@@ -83,11 +96,12 @@ app.get('/', (req, res) => {
 
           const endpoint = '/api/v1/generate-image?prompt=' + encodeURIComponent(promptInput);
           statusDiv.className = '';
+          resultDiv.style.display = 'none';
           btn.disabled = true;
 
           try {
             // --- Step 1: unpaid request to receive the 402 challenge ----------
-            statusDiv.innerText = '1/4 Requesting payment terms...';
+            statusDiv.innerText = '1/5 Requesting payment terms...';
             const probe = await fetch(endpoint);
 
             if (probe.status !== 402) {
@@ -100,14 +114,12 @@ app.get('/', (req, res) => {
               throw new Error('Expected 402, got ' + probe.status + ': ' + body);
             }
 
-            // V2: requirements are in the PAYMENT-REQUIRED header.
-            // Fall back to the body only for a V1-style server.
             const headerValue = probe.headers.get('PAYMENT-REQUIRED');
             let challenge = headerValue ? b64ToJson(headerValue) : null;
             if (!challenge) {
               try { challenge = await probe.clone().json(); } catch (e) { challenge = null; }
             }
-            if (!challenge) throw new Error('402 received but no PAYMENT-REQUIRED header and no JSON body could be parsed.');
+            if (!challenge) throw new Error('402 received but no PAYMENT-REQUIRED header and no parseable body.');
 
             const options = challenge.accepts || [];
             const chosen = options.find(o => o.scheme === 'exact' && String(o.network || '').includes('8453'));
@@ -126,7 +138,7 @@ app.get('/', (req, res) => {
             }
 
             // --- Step 2: connect wallet and ensure it is on Base --------------
-            statusDiv.innerText = '2/4 Connecting wallet...';
+            statusDiv.innerText = '2/5 Connecting wallet...';
             const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
             const userAddress = accounts[0];
 
@@ -159,25 +171,20 @@ app.get('/', (req, res) => {
             }
 
             // --- Step 3: sign the EIP-3009 transferWithAuthorization ----------
-            statusDiv.innerText = '3/4 Confirming USDC authorization in wallet...';
+            statusDiv.innerText = '3/5 Confirming USDC authorization in wallet...';
             const now = Math.floor(Date.now() / 1000);
 
             const authorization = {
               from: userAddress,
               to: chosen.payTo,
               value: amount,
-              validAfter: String(now - 300),        // backdated for clock skew
+              validAfter: String(now - 300),
               validBefore: String(now + timeout),
               nonce: randomNonce()
             };
 
             const typedData = {
-              domain: {
-                name: tokenName,
-                version: tokenVersion,
-                chainId: chainId,
-                verifyingContract: asset
-              },
+              domain: { name: tokenName, version: tokenVersion, chainId: chainId, verifyingContract: asset },
               types: {
                 EIP712Domain: [
                   { name: 'name', type: 'string' },
@@ -203,8 +210,8 @@ app.get('/', (req, res) => {
               params: [userAddress, JSON.stringify(typedData)]
             });
 
-            // --- Step 4: retry with PAYMENT-SIGNATURE ------------------------
-            statusDiv.innerText = '4/4 Verifying and settling with facilitator...';
+            // --- Step 4/5: retry with PAYMENT-SIGNATURE, wait for the image ---
+            statusDiv.innerText = '4/5 Settling payment...\\n5/5 Generating image (this can take 10-30s)...';
 
             const paymentPayload = {
               x402Version: challenge.x402Version ?? 2,
@@ -250,9 +257,17 @@ app.get('/', (req, res) => {
               throw new Error('HTTP ' + paid.status + ' — ' + detail);
             }
 
+            const data = JSON.parse(rawBody);
+            if (!data.image) throw new Error('Paid successfully but no image returned: ' + rawBody);
+
+            imgEl.src = 'data:' + (data.mimeType || 'image/webp') + ';base64,' + data.image;
+            const tx = settlement && settlement.transaction;
+            metaEl.innerHTML = 'Prompt: ' + (data.prompt || '') + '<br>Model: ' + (data.model || '') +
+              (tx ? '<br>Tx: <a href="https://basescan.org/tx/' + tx + '" target="_blank" rel="noopener">' + tx + '</a>' : '');
+            resultDiv.style.display = 'block';
+
             statusDiv.className = 'success';
-            statusDiv.innerText = 'Payment settled!\\n' + rawBody +
-              (settlement ? '\\n\\nTx: ' + (settlement.transaction || JSON.stringify(settlement)) : '');
+            statusDiv.innerText = 'Paid and generated.';
           } catch (err) {
             fail('Error: ' + (err.message || JSON.stringify(err)));
             console.error(err);
@@ -314,23 +329,110 @@ const routes = {
 app.use(paymentMiddleware(routes, x402Server));
 
 // ---------------------------------------------------------------------------
-// 4. Protected route
+// 4. Image generation via Replicate
+//    Uses the official-model endpoint with `Prefer: wait` so the request
+//    blocks until the prediction finishes, then polls if it needs longer.
 // ---------------------------------------------------------------------------
-app.get('/api/v1/generate-image', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Payment verified!',
-    prompt: req.query.prompt || 'Default prompt'
-  });
+async function replicateGenerate(prompt) {
+  if (!REPLICATE_TOKEN) throw new Error('REPLICATE_API_TOKEN is not set on the server');
+
+  const headers = {
+    Authorization: `Bearer ${REPLICATE_TOKEN}`,
+    'Content-Type': 'application/json'
+  };
+
+  const created = await fetch(
+    `https://api.replicate.com/v1/models/${REPLICATE_MODEL}/predictions`,
+    {
+      method: 'POST',
+      headers: { ...headers, Prefer: 'wait=55' },
+      body: JSON.stringify({
+        input: {
+          prompt,
+          num_outputs: 1,
+          aspect_ratio: '1:1',
+          output_format: 'webp',
+          output_quality: 90
+        }
+      })
+    }
+  );
+
+  if (!created.ok) {
+    throw new Error(`Replicate ${created.status}: ${await created.text()}`);
+  }
+
+  let prediction = await created.json();
+
+  // Poll if `Prefer: wait` returned before the prediction finished.
+  const deadline = Date.now() + 120000;
+  while (['starting', 'processing'].includes(prediction.status) && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 1500));
+    const poll = await fetch(prediction.urls.get, { headers });
+    if (!poll.ok) throw new Error(`Replicate poll ${poll.status}: ${await poll.text()}`);
+    prediction = await poll.json();
+  }
+
+  if (prediction.status !== 'succeeded') {
+    throw new Error(`Prediction ${prediction.status}: ${prediction.error || 'timed out'}`);
+  }
+
+  const out = prediction.output;
+  const imageUrl = Array.isArray(out) ? out[0] : out;
+  if (typeof imageUrl !== 'string') {
+    throw new Error('Unexpected Replicate output shape: ' + JSON.stringify(out));
+  }
+
+  const file = await fetch(imageUrl);
+  if (!file.ok) throw new Error(`Could not download image: ${file.status}`);
+
+  const buffer = Buffer.from(await file.arrayBuffer());
+  return {
+    base64: buffer.toString('base64'),
+    mimeType: file.headers.get('content-type') || 'image/webp',
+    url: imageUrl
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 5. Protected route — only reached after the payment settles
+// ---------------------------------------------------------------------------
+app.get('/api/v1/generate-image', async (req, res) => {
+  const prompt = (req.query.prompt || '').toString().trim();
+  if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+
+  try {
+    console.log(`[gen] generating: "${prompt}"`);
+    const image = await replicateGenerate(prompt);
+    console.log(`[gen] done, ${Math.round(image.base64.length / 1365)} KB`);
+
+    res.json({
+      success: true,
+      prompt,
+      model: REPLICATE_MODEL,
+      mimeType: image.mimeType,
+      image: image.base64,
+      sourceUrl: image.url
+    });
+  } catch (err) {
+    // NOTE: the payment has already settled by the time we get here. Log
+    // enough to honour a manual retry or refund for the payer.
+    console.error('[gen] FAILED AFTER PAYMENT:', prompt, err);
+    res.status(502).json({
+      error: 'Payment settled but image generation failed: ' + err.message,
+      prompt
+    });
+  }
 });
 
-app.get('/healthz', (req, res) => res.json({ ok: true, protocol: 'x402 v2' }));
+app.get('/healthz', (req, res) =>
+  res.json({ ok: true, protocol: 'x402 v2', replicate: Boolean(REPLICATE_TOKEN), model: REPLICATE_MODEL })
+);
 
-// Surface middleware errors rather than letting Express swallow them
 app.use((err, req, res, next) => {
   console.error('[x402] middleware error:', err);
   res.status(err.status || 500).json({ error: err.message || String(err) });
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT} (x402 V2)`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT} (x402 V2 + Replicate)`));
