@@ -3,16 +3,25 @@ import crypto from 'crypto';
 import { paymentMiddleware, x402ResourceServer } from '@x402/express';
 import { HTTPFacilitatorClient } from '@x402/core/server';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
+import { createFacilitatorConfig } from '@coinbase/x402';
+import {
+  bazaarResourceServerExtension,
+  declareDiscoveryExtension,
+  withBazaar
+} from '@x402/extensions/bazaar';
 
 const app = express();
 app.set('trust proxy', true);
 app.use(express.json());
 
-const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
+const WALLET_ADDRESS = process.env.PAY_TO_ADDRESS || '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 const BASE_URL = process.env.BASE_URL || 'https://x402-image-api.onrender.com';
 
 const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
 const REPLICATE_MODEL = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell';
+
+const CDP_KEY_ID = process.env.CDP_API_KEY_ID;
+const CDP_KEY_SECRET = process.env.CDP_API_KEY_SECRET;
 
 // ---------------------------------------------------------------------------
 // In-memory image cache so a paid result can be re-fetched as real bytes.
@@ -383,6 +392,11 @@ app.get('/', (req, res) => {
               payload: { signature, authorization }
             };
 
+            // Echo the server's extensions back. The Bazaar indexer reads its
+            // discovery block out of the client's payload, so dropping this
+            // would keep the service out of the catalog.
+            if (challenge.extensions) paymentPayload.extensions = challenge.extensions;
+
             if (chosen.resource || chosen.description || chosen.mimeType) {
               paymentPayload.resource = {
                 url: chosen.resource || (window.location.origin + endpoint.split('?')[0]),
@@ -439,13 +453,32 @@ app.get('/', (req, res) => {
 
 // ---------------------------------------------------------------------------
 // 2. Facilitator client + resource server
+//
+//    Bazaar indexing only happens when the CDP facilitator settles a payment
+//    for a route that declares discovery metadata. Settling through any other
+//    facilitator means Coinbase never sees the traffic and the service never
+//    appears on agentic.market. withBazaar() adds catalog query support on top
+//    of the normal verify/settle client.
 // ---------------------------------------------------------------------------
-const facilitatorClient = new HTTPFacilitatorClient({
-  url: process.env.FACILITATOR_URL || 'https://facilitator.payai.network'
-});
+const usingCdp = Boolean(CDP_KEY_ID && CDP_KEY_SECRET);
+
+if (!usingCdp) {
+  console.warn(
+    '[x402] CDP_API_KEY_ID / CDP_API_KEY_SECRET missing — falling back to PayAI. ' +
+    'Payments will work but the service will NOT be indexed for agentic.market.'
+  );
+}
+
+const facilitatorClient = usingCdp
+  ? withBazaar(new HTTPFacilitatorClient(createFacilitatorConfig(CDP_KEY_ID, CDP_KEY_SECRET)))
+  : new HTTPFacilitatorClient({ url: process.env.FACILITATOR_URL || 'https://facilitator.payai.network' });
 
 const x402Server = new x402ResourceServer(facilitatorClient);
 x402Server.register('eip155:8453', new ExactEvmScheme());
+
+if (usingCdp) {
+  x402Server.registerExtension(bazaarResourceServerExtension);
+}
 
 // ---------------------------------------------------------------------------
 // 3. Retrieval endpoint — registered BEFORE the payment middleware so an
@@ -490,6 +523,49 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
+// Discovery metadata. This is what the Bazaar indexes and what agents read to
+// decide whether to call the endpoint, so the description and examples matter.
+const discovery = declareDiscoveryExtension({
+  input: { prompt: 'a cyberpunk city skyline at dusk, neon reflections' },
+  inputSchema: {
+    properties: {
+      prompt: {
+        type: 'string',
+        description: 'Text description of the image to generate'
+      },
+      format: {
+        type: 'string',
+        enum: ['json', 'binary'],
+        description: 'json returns base64 plus a retrieval URL; binary returns raw image bytes'
+      }
+    },
+    required: ['prompt']
+  },
+  output: {
+    example: {
+      success: true,
+      prompt: 'a cyberpunk city skyline at dusk, neon reflections',
+      model: 'black-forest-labs/flux-schnell',
+      mimeType: 'image/webp',
+      image: '<base64-encoded image bytes>',
+      absoluteUrl: `${BASE_URL}/api/v1/image/9f2c...`,
+      expiresInSeconds: 3600
+    },
+    schema: {
+      properties: {
+        success: { type: 'boolean' },
+        prompt: { type: 'string' },
+        model: { type: 'string' },
+        mimeType: { type: 'string' },
+        image: { type: 'string', description: 'Base64-encoded image' },
+        absoluteUrl: { type: 'string', description: 'Direct image URL, valid 1 hour' },
+        downloadUrl: { type: 'string' },
+        expiresInSeconds: { type: 'number' }
+      }
+    }
+  }
+});
+
 const routes = {
   'GET /api/v1/generate-image': {
     accepts: [
@@ -500,8 +576,11 @@ const routes = {
         payTo: WALLET_ADDRESS
       }
     ],
-    description: 'AI image generation, one prompt',
-    mimeType: 'application/json'
+    description:
+      'Text-to-image generation powered by FLUX. Send a prompt, get back a 1024x1024 image as ' +
+      'base64 JSON or raw bytes, plus a direct URL valid for one hour. No API key or account needed.',
+    mimeType: 'application/json',
+    extensions: { ...discovery }
   }
 };
 
@@ -611,6 +690,9 @@ app.get('/healthz', (req, res) =>
   res.json({
     ok: true,
     protocol: 'x402 v2',
+    facilitator: usingCdp ? 'cdp' : 'payai',
+    bazaarEnabled: usingCdp,
+    payTo: WALLET_ADDRESS,
     replicate: Boolean(REPLICATE_TOKEN),
     model: REPLICATE_MODEL,
     cachedImages: imageCache.size
@@ -623,4 +705,5 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT} (x402 V2 + Replicate)`));
+app.listen(PORT, () =>
+  console.log(`Server on port ${PORT} — facilitator: ${usingCdp ? 'CDP (Bazaar on)' : 'PayAI (Bazaar off)'}`)
