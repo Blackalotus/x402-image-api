@@ -1708,3 +1708,4 @@ const storageLabel = r2Enabled ? 'R2' : 'memory-only';
 app.listen(PORT, function () {
   console.log('Server on port ' + PORT + ' - facilitator: ' + facilitatorLabel + ', storage: ' + storageLabel);
   console.log('Endpoints: ' + ENDPOINTS.map(e => e.method + ' ' + e.path + ' $' + e.price).join(', '));
+  });
