@@ -12,7 +12,7 @@ import {
   withBazaar
 } from '@x402/extensions/bazaar';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import pdfParse from 'pdf-parse/lib/pdf-parse.js';
+import { PDFParse } from 'pdf-parse';
 
 const app = express();
 app.set('trust proxy', true);
@@ -570,30 +570,44 @@ function textToMarkdown(raw) {
 }
 
 async function convertPdf(buffer, { pageMarkers = false } = {}) {
-  const pages = [];
-  const data = await pdfParse(buffer, {
-    pagerender: pageData =>
-      pageData.getTextContent({ normalizeWhitespace: true }).then(content => {
-        let lastY; let text = '';
-        for (const item of content.items) {
-          const y = item.transform[5];
-          if (lastY !== undefined && Math.abs(lastY - y) > 1) text += '\n';
-          text += item.str;
-          lastY = y;
-        }
-        pages.push(text);
-        return text + '\n';
-      })
-  });
+  const parser = new PDFParse({ data: buffer });
 
-  const markdown = pageMarkers
-    ? pages.map((p, i) => `${i > 0 ? '\n---\n\n' : ''}<!-- page ${i + 1} -->\n\n${textToMarkdown(p)}`).join('\n\n')
-    : textToMarkdown(pages.join('\n\n'));
+  try {
+    // v2 exposes info and text separately; exact shapes vary a little between
+    // builds, so read defensively rather than assuming one layout.
+    let title = null;
+    try {
+      const info = await parser.getInfo();
+      const meta = (info && (info.info || info.metadata || info)) || {};
+      if (typeof meta.Title === 'string' && meta.Title.trim()) title = meta.Title.trim();
+    } catch (e) {
+      // Info is optional — a missing document dictionary shouldn't fail the call.
+    }
 
-  const title = data.info && typeof data.info.Title === 'string' && data.info.Title.trim()
-    ? data.info.Title.trim() : null;
+    const result = await parser.getText();
 
-  return { markdown, pages: data.numpages, title };
+    const pageTexts = Array.isArray(result.pages)
+      ? result.pages.map(p => (typeof p === 'string' ? p : (p && (p.text || p.content)) || ''))
+      : [];
+
+    const whole = typeof result.text === 'string' && result.text.length
+      ? result.text
+      : pageTexts.join('\n\n');
+
+    const markdown = pageMarkers && pageTexts.length
+      ? pageTexts
+          .map((p, i) => `${i > 0 ? '\n---\n\n' : ''}<!-- page ${i + 1} -->\n\n${textToMarkdown(p)}`)
+          .join('\n\n')
+      : textToMarkdown(whole);
+
+    const pages = result.total || pageTexts.length || 1;
+
+    return { markdown, pages, title };
+  } finally {
+    // v2 keeps a worker alive per parser instance; skipping destroy would leak
+    // memory on every paid call.
+    await parser.destroy().catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1708,4 +1722,4 @@ const storageLabel = r2Enabled ? 'R2' : 'memory-only';
 app.listen(PORT, function () {
   console.log('Server on port ' + PORT + ' - facilitator: ' + facilitatorLabel + ', storage: ' + storageLabel);
   console.log('Endpoints: ' + ENDPOINTS.map(e => e.method + ' ' + e.path + ' $' + e.price).join(', '));
-  });
+});
