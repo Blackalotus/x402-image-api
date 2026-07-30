@@ -553,7 +553,9 @@ app.get('/openapi.json', (req, res) => {
       description:
         'Text-to-image generation powered by FLUX. Pay per image in USDC on Base. ' +
         'No API key, account, or subscription.',
-      version: '1.0.0'
+            version: '1.0.0',
+      contact: { email: 'blacklotusfinance.pls@gmail.com' }
+
     },
     servers: [{ url: BASE_URL }],
     paths: {
