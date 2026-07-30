@@ -12,9 +12,14 @@ const BASE_URL = process.env.BASE_URL || 'https://x402-image-api.onrender.com';
 
 // ---------------------------------------------------------------------------
 // 1. Human UI homepage
-//    The client no longer invents the payment terms. It first hits the
-//    protected endpoint with no X-PAYMENT header, reads the 402 challenge,
-//    and signs EXACTLY what the server asked for.
+//
+//    x402 V2 protocol notes baked into this client:
+//      - Requirements arrive in the base64 PAYMENT-REQUIRED response header
+//        (NOT the JSON body — that was the "accepts: []" failure).
+//      - The client retries with PAYMENT-SIGNATURE (NOT X-PAYMENT, which is V1).
+//      - The PaymentPayload must echo back an `accepted` object describing the
+//        requirement that was chosen, alongside payload.{signature,authorization}.
+//      - Settlement result comes back in the PAYMENT-RESPONSE header.
 // ---------------------------------------------------------------------------
 app.get('/', (req, res) => {
   res.send(`
@@ -41,7 +46,7 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div class="card">
-        <h1>AI Image Generator <span class="badge">x402 Active</span></h1>
+        <h1>AI Image Generator <span class="badge">x402 V2</span></h1>
         <p>Enter a prompt below. Payment of $0.05 Base USDC will be prompted via your connected wallet.</p>
         <input type="text" id="prompt" placeholder="Type your prompt here..." value="" />
         <button id="btn" onclick="generate()">Generate Image ($0.05 Base USDC)</button>
@@ -55,11 +60,22 @@ app.get('/', (req, res) => {
           return '0x' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
         }
 
+        function b64ToJson(value) {
+          try {
+            return JSON.parse(decodeURIComponent(escape(atob(value))));
+          } catch (e) {
+            try { return JSON.parse(atob(value)); } catch (e2) { return null; }
+          }
+        }
+
+        function jsonToB64(obj) {
+          return btoa(unescape(encodeURIComponent(JSON.stringify(obj))));
+        }
+
         async function generate() {
           const promptInput = document.getElementById('prompt').value.trim();
           const statusDiv = document.getElementById('status');
           const btn = document.getElementById('btn');
-
           const fail = (msg) => { statusDiv.className = 'error'; statusDiv.innerText = msg; };
 
           if (!promptInput) return fail('Please enter a prompt first.');
@@ -70,41 +86,53 @@ app.get('/', (req, res) => {
           btn.disabled = true;
 
           try {
-            // --- Step 1: ask the server what it wants (unpaid request) --------
+            // --- Step 1: unpaid request to receive the 402 challenge ----------
             statusDiv.innerText = '1/4 Requesting payment terms...';
             const probe = await fetch(endpoint);
 
             if (probe.status !== 402) {
-              // Either it's already unlocked, or something is misconfigured.
               const body = await probe.text();
               if (probe.ok) {
                 statusDiv.className = 'success';
-                statusDiv.innerText = 'Delivered without payment (middleware not gating this route): ' + body;
+                statusDiv.innerText = 'Served without payment — middleware is not gating this route:\\n' + body;
                 return;
               }
-              throw new Error('Expected HTTP 402 challenge, got ' + probe.status + ': ' + body);
+              throw new Error('Expected 402, got ' + probe.status + ': ' + body);
             }
 
-            const challenge = await probe.json();
-            const accepts = challenge.accepts || [];
-            const req402 = accepts.find(a => a.scheme === 'exact' && String(a.network).includes('8453'));
-            if (!req402) throw new Error('Server offered no exact/Base payment option: ' + JSON.stringify(accepts));
+            // V2: requirements are in the PAYMENT-REQUIRED header.
+            // Fall back to the body only for a V1-style server.
+            const headerValue = probe.headers.get('PAYMENT-REQUIRED');
+            let challenge = headerValue ? b64ToJson(headerValue) : null;
+            if (!challenge) {
+              try { challenge = await probe.clone().json(); } catch (e) { challenge = null; }
+            }
+            if (!challenge) throw new Error('402 received but no PAYMENT-REQUIRED header and no JSON body could be parsed.');
 
-            const chainId = parseInt(String(req402.network).split(':').pop(), 10);
-            const amount = req402.maxAmountRequired;          // atomic units, e.g. "50000"
-            const asset = req402.asset;                       // USDC contract on Base
-            const tokenName = (req402.extra && req402.extra.name) || 'USD Coin';
-            const tokenVersion = (req402.extra && req402.extra.version) || '2';
-            const timeout = req402.maxTimeoutSeconds || 600;
+            const options = challenge.accepts || [];
+            const chosen = options.find(o => o.scheme === 'exact' && String(o.network || '').includes('8453'));
+            if (!chosen) throw new Error('No exact/Base option in challenge: ' + JSON.stringify(challenge));
 
-            // --- Step 2: connect wallet, make sure it's on Base --------------
+            const chainId = parseInt(String(chosen.network).split(':').pop(), 10);
+            const amount = String(chosen.amount ?? chosen.maxAmountRequired);
+            const asset = chosen.asset;
+            const extra = chosen.extra || {};
+            const tokenName = extra.name || 'USD Coin';
+            const tokenVersion = extra.version || '2';
+            const timeout = chosen.maxTimeoutSeconds || 600;
+
+            if (!amount || amount === 'undefined' || !asset) {
+              throw new Error('Challenge missing amount/asset: ' + JSON.stringify(chosen));
+            }
+
+            // --- Step 2: connect wallet and ensure it is on Base --------------
             statusDiv.innerText = '2/4 Connecting wallet...';
             const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
             const userAddress = accounts[0];
 
             const wantHex = '0x' + chainId.toString(16);
-            const currentChain = await window.ethereum.request({ method: 'eth_chainId' });
-            if (currentChain !== wantHex) {
+            let current = await window.ethereum.request({ method: 'eth_chainId' });
+            if (current !== wantHex) {
               try {
                 await window.ethereum.request({
                   method: 'wallet_switchEthereumChain',
@@ -123,22 +151,22 @@ app.get('/', (req, res) => {
                     }]
                   });
                 } else {
-                  throw new Error('Wallet refused to switch to Base (chain ' + chainId + '): ' + (switchErr.message || switchErr.code));
+                  throw new Error('Wallet would not switch to Base: ' + (switchErr.message || switchErr.code));
                 }
               }
-              const after = await window.ethereum.request({ method: 'eth_chainId' });
-              if (after !== wantHex) throw new Error('Wallet is on chain ' + after + ', needs ' + wantHex + ' (Base).');
+              current = await window.ethereum.request({ method: 'eth_chainId' });
+              if (current !== wantHex) throw new Error('Wallet is on ' + current + ', needs ' + wantHex + ' (Base).');
             }
 
-            // --- Step 3: sign the EIP-3009 authorization ---------------------
-            statusDiv.innerText = '3/4 Confirming USDC permit in wallet...';
+            // --- Step 3: sign the EIP-3009 transferWithAuthorization ----------
+            statusDiv.innerText = '3/4 Confirming USDC authorization in wallet...';
             const now = Math.floor(Date.now() / 1000);
 
             const authorization = {
               from: userAddress,
-              to: req402.payTo,
-              value: String(amount),
-              validAfter: String(now - 300),          // backdated for clock skew
+              to: chosen.payTo,
+              value: amount,
+              validAfter: String(now - 300),        // backdated for clock skew
               validBefore: String(now + timeout),
               nonce: randomNonce()
             };
@@ -175,31 +203,56 @@ app.get('/', (req, res) => {
               params: [userAddress, JSON.stringify(typedData)]
             });
 
-            // --- Step 4: retry with the payment header ----------------------
-            statusDiv.innerText = '4/4 Verifying micropayment with facilitator...';
+            // --- Step 4: retry with PAYMENT-SIGNATURE ------------------------
+            statusDiv.innerText = '4/4 Verifying and settling with facilitator...';
 
             const paymentPayload = {
               x402Version: challenge.x402Version ?? 2,
-              scheme: req402.scheme,
-              network: req402.network,
+              accepted: {
+                scheme: chosen.scheme,
+                network: chosen.network,
+                amount: amount,
+                asset: asset,
+                payTo: chosen.payTo,
+                maxTimeoutSeconds: timeout,
+                extra: {
+                  assetTransferMethod: extra.assetTransferMethod || 'eip3009',
+                  name: tokenName,
+                  version: tokenVersion
+                }
+              },
               payload: { signature, authorization }
             };
 
-            const header = btoa(JSON.stringify(paymentPayload));
-            const paid = await fetch(endpoint, { headers: { 'X-PAYMENT': header } });
+            if (chosen.resource || chosen.description || chosen.mimeType) {
+              paymentPayload.resource = {
+                url: chosen.resource || (window.location.origin + endpoint.split('?')[0]),
+                description: chosen.description || '',
+                mimeType: chosen.mimeType || 'application/json'
+              };
+            }
+
+            const paid = await fetch(endpoint, {
+              headers: { 'PAYMENT-SIGNATURE': jsonToB64(paymentPayload) }
+            });
+
             const rawBody = await paid.text();
+            const settleHeader = paid.headers.get('PAYMENT-RESPONSE');
+            const settlement = settleHeader ? b64ToJson(settleHeader) : null;
 
             if (!paid.ok) {
               let detail = rawBody;
               try {
                 const parsed = JSON.parse(rawBody);
-                detail = parsed.error || parsed.message || parsed.errorReason || rawBody;
-              } catch (_) {}
+                detail = parsed.error || parsed.errorReason || parsed.message || rawBody;
+              } catch (e) {}
+              if (settlement) detail += '\\nSettlement: ' + JSON.stringify(settlement);
               throw new Error('HTTP ' + paid.status + ' — ' + detail);
             }
 
             statusDiv.className = 'success';
-            statusDiv.innerText = 'Payment verified!\\n' + rawBody;
+            statusDiv.innerText = 'Payment settled!\\n' + rawBody +
+              (settlement ? '\\n\\nTx: ' + (settlement.transaction || JSON.stringify(settlement)) : '');
           } catch (err) {
             fail('Error: ' + (err.message || JSON.stringify(err)));
             console.error(err);
@@ -214,7 +267,7 @@ app.get('/', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Facilitator + resource server
+// 2. Facilitator client + resource server
 // ---------------------------------------------------------------------------
 const facilitatorClient = new HTTPFacilitatorClient({
   url: process.env.FACILITATOR_URL || 'https://facilitator.payai.network'
@@ -224,9 +277,25 @@ const x402Server = new x402ResourceServer(facilitatorClient);
 x402Server.register('eip155:8453', new ExactEvmScheme());
 
 // ---------------------------------------------------------------------------
-// 3. Route protection. Log the inbound header so failures are debuggable
-//    in the Render logs, then hand off to the middleware.
+// 3. Diagnostics, then route protection
 // ---------------------------------------------------------------------------
+app.use('/api', (req, res, next) => {
+  const sig = req.headers['payment-signature'] || req.headers['x-payment'];
+  if (!sig) {
+    console.log(`[x402] ${req.method} ${req.originalUrl} — no PAYMENT-SIGNATURE, issuing 402`);
+  } else {
+    if (req.headers['x-payment'] && !req.headers['payment-signature']) {
+      console.warn('[x402] client sent V1 X-PAYMENT; V2 middleware expects PAYMENT-SIGNATURE');
+    }
+    try {
+      console.log('[x402] inbound payload:', Buffer.from(sig, 'base64').toString('utf8'));
+    } catch (e) {
+      console.warn('[x402] payment header is not valid base64');
+    }
+  }
+  next();
+});
+
 const routes = {
   'GET /api/v1/generate-image': {
     accepts: [
@@ -237,23 +306,10 @@ const routes = {
         payTo: WALLET_ADDRESS
       }
     ],
-    resource: `${BASE_URL}/api/v1/generate-image`
+    description: 'AI image generation, one prompt',
+    mimeType: 'application/json'
   }
 };
-
-app.use('/api', (req, res, next) => {
-  const hdr = req.headers['x-payment'];
-  if (!hdr) {
-    console.log(`[x402] ${req.method} ${req.originalUrl} — no X-PAYMENT, issuing challenge`);
-  } else {
-    try {
-      console.log(`[x402] inbound payment:`, JSON.stringify(JSON.parse(Buffer.from(hdr, 'base64').toString())));
-    } catch (e) {
-      console.log('[x402] X-PAYMENT header is not valid base64 JSON');
-    }
-  }
-  next();
-});
 
 app.use(paymentMiddleware(routes, x402Server));
 
@@ -268,15 +324,13 @@ app.get('/api/v1/generate-image', (req, res) => {
   });
 });
 
-app.get('/healthz', (req, res) => res.json({ ok: true }));
+app.get('/healthz', (req, res) => res.json({ ok: true, protocol: 'x402 v2' }));
 
-// Surface middleware errors instead of letting Express swallow them
+// Surface middleware errors rather than letting Express swallow them
 app.use((err, req, res, next) => {
   console.error('[x402] middleware error:', err);
   res.status(err.status || 500).json({ error: err.message || String(err) });
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT} (x402 V2)`));
