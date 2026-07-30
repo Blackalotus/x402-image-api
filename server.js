@@ -16,7 +16,7 @@ app.set('trust proxy', true);
 app.use(express.json());
 
 const WALLET_ADDRESS = process.env.PAY_TO_ADDRESS || '0x3268C9434D8603957420f04510CA0ff6097A5C64';
-const BASE_URL = process.env.BASE_URL || 'https://x402-image-api.onrender.com';
+const BASE_URL = process.env.BASE_URL || 'https://lotusnetworkapi.com';
 
 const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
 const REPLICATE_MODEL = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell';
@@ -29,6 +29,8 @@ const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
 const R2_BUCKET = process.env.R2_BUCKET || 'x402-images';
 const RETENTION_DAYS = Number(process.env.IMAGE_RETENTION_DAYS || 30);
+
+const PRICE_USD = process.env.PRICE_USD || '0.05';
 
 // ---------------------------------------------------------------------------
 // Storage. R2 is the durable store; a small in-process LRU sits in front so
@@ -166,9 +168,9 @@ app.get('/', (req, res) => {
     <body>
       <div class="card">
         <h1>AI Image Generator <span class="badge">x402 V2</span></h1>
-        <p>Enter a prompt below. Payment of $0.05 Base USDC will be prompted via your connected wallet.</p>
+        <p>Enter a prompt below. Payment of $${PRICE_USD} Base USDC will be prompted via your connected wallet.</p>
         <input type="text" id="prompt" placeholder="Type your prompt here..." value="" />
-        <button id="btn" onclick="generate()">Generate Image ($0.05 Base USDC)</button>
+        <button id="btn" onclick="generate()">Generate Image ($${PRICE_USD} Base USDC)</button>
         <div id="status"></div>
 
         <div id="result">
@@ -538,7 +540,91 @@ app.get('/', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Facilitator client + resource server
+// 2. OpenAPI discovery document.
+//    x402scan and similar indexes fetch /openapi.json to register the resource
+//    and then verify the runtime 402 behaviour matches. This is a separate
+//    mechanism from the Bazaar extension below, which serves CDP/agentic.market.
+// ---------------------------------------------------------------------------
+app.get('/openapi.json', (req, res) => {
+  res.json({
+    openapi: '3.0.3',
+    info: {
+      title: 'AI Image Studio',
+      description:
+        'Text-to-image generation powered by FLUX. Pay per image in USDC on Base. ' +
+        'No API key, account, or subscription.',
+      version: '1.0.0'
+    },
+    servers: [{ url: BASE_URL }],
+    paths: {
+      '/api/v1/generate-image': {
+        get: {
+          operationId: 'generateImage',
+          summary: 'Generate an image from a text prompt',
+          tags: ['Media'],
+          'x-payment-info': {
+            price: { mode: 'fixed', currency: 'USD', amount: Number(PRICE_USD).toFixed(6) },
+            protocols: [{ x402: {} }]
+          },
+          parameters: [
+            {
+              name: 'prompt',
+              in: 'query',
+              required: true,
+              description: 'Text description of the image to generate',
+              schema: { type: 'string' },
+              example: 'a cyberpunk city skyline at dusk, neon reflections'
+            },
+            {
+              name: 'format',
+              in: 'query',
+              required: false,
+              description: 'json returns base64 plus a durable URL; binary returns raw image bytes',
+              schema: { type: 'string', enum: ['json', 'binary'], default: 'json' }
+            }
+          ],
+          responses: {
+            200: {
+              description: 'Generated image',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      success: { type: 'boolean' },
+                      prompt: { type: 'string' },
+                      model: { type: 'string' },
+                      mimeType: { type: 'string' },
+                      image: { type: 'string', description: 'Base64-encoded image' },
+                      absoluteUrl: { type: 'string', description: 'Durable image URL' },
+                      downloadUrl: { type: 'string' },
+                      retentionDays: { type: 'number' }
+                    },
+                    required: ['success', 'image']
+                  },
+                  example: {
+                    success: true,
+                    prompt: 'a cyberpunk city skyline at dusk, neon reflections',
+                    model: 'black-forest-labs/flux-schnell',
+                    mimeType: 'image/webp',
+                    image: '<base64>',
+                    absoluteUrl: `${BASE_URL}/api/v1/image/9f2c4a1e7b3d5f8091a2b3c4d5e6f708`
+                  }
+                }
+              }
+            },
+            402: {
+              description: 'Payment required. Terms are in the PAYMENT-REQUIRED response header.'
+            }
+          }
+        }
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. Facilitator client + resource server
 //
 //    Bazaar indexing only happens when the CDP facilitator settles a payment
 //    for a route that declares discovery metadata. Settling through any other
@@ -566,7 +652,7 @@ if (usingCdp) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Retrieval endpoint — registered BEFORE the payment middleware so an
+// 4. Retrieval endpoint — registered BEFORE the payment middleware so an
 //    already-paid-for image can be fetched again without paying twice.
 //    The 128-bit random id is the access credential.
 // ---------------------------------------------------------------------------
@@ -595,7 +681,7 @@ app.get('/api/v1/image/:id', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Diagnostics, then route protection
+// 5. Diagnostics, then route protection
 // ---------------------------------------------------------------------------
 app.use('/api', (req, res, next) => {
   const sig = req.headers['payment-signature'] || req.headers['x-payment'];
@@ -661,7 +747,7 @@ const routes = {
     accepts: [
       {
         scheme: 'exact',
-        price: '$0.05',
+        price: `$${PRICE_USD}`,
         network: 'eip155:8453',
         payTo: WALLET_ADDRESS
       }
@@ -677,7 +763,7 @@ const routes = {
 app.use(paymentMiddleware(routes, x402Server));
 
 // ---------------------------------------------------------------------------
-// 5. Image generation via Replicate
+// 6. Image generation via Replicate
 // ---------------------------------------------------------------------------
 async function replicateGenerate(prompt) {
   if (!REPLICATE_TOKEN) throw new Error('REPLICATE_API_TOKEN is not set on the server');
@@ -736,7 +822,7 @@ async function replicateGenerate(prompt) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Protected route — only reached after the payment settles.
+// 7. Protected route — only reached after the payment settles.
 //    ?format=binary returns raw image bytes for agents that would rather not
 //    decode base64 out of JSON.
 // ---------------------------------------------------------------------------
@@ -797,6 +883,8 @@ app.get('/healthz', (req, res) =>
   res.json({
     ok: true,
     protocol: 'x402 v2',
+    baseUrl: BASE_URL,
+    price: PRICE_USD,
     facilitator: usingCdp ? 'cdp' : 'payai',
     bazaarEnabled: usingCdp,
     payTo: WALLET_ADDRESS,
