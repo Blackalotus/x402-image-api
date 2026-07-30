@@ -1298,13 +1298,15 @@ app.get('/', (req, res) => {
             payload: { signature, authorization }
           };
           if (challenge.extensions) paymentPayload.extensions = challenge.extensions;
-          if (chosen.resource || chosen.description || chosen.mimeType) {
-            paymentPayload.resource = {
-              url: chosen.resource || (window.location.origin + path.split('?')[0]),
-              description: chosen.description || '',
-              mimeType: chosen.mimeType || 'application/json'
-            };
-          }
+
+          // In x402 V2 the resource object sits at the TOP LEVEL of the
+          // PaymentRequired challenge, not inside an accepts entry. The
+          // facilitator rejects the Bazaar discovery request without it.
+          paymentPayload.resource = challenge.resource || {
+            url: window.location.origin + path.split('?')[0],
+            description: chosen.description || '',
+            mimeType: chosen.mimeType || 'application/json'
+          };
 
           const headers = { 'PAYMENT-SIGNATURE': jsonToB64(paymentPayload) };
           if (body) headers['Content-Type'] = 'application/json';
@@ -1777,13 +1779,13 @@ for (const ep of ENDPOINTS) {
     }],
     description: ep.description,
     mimeType: 'application/json',
-    // The Bazaar rejects a discovery registration without an absolute
-    // resource URL ("resource is required"), even though payment settles fine.
-    resource: `${BASE_URL}${ep.path}`,
     extensions: {
       ...declareDiscoveryExtension({
         input: ep.inputExample,
         inputSchema: ep.inputSchema,
+        // POST/PUT/PATCH must declare how the body is encoded, or the
+        // extension can't narrow /input/method and the route is rejected.
+        ...(ep.method === 'GET' ? {} : { bodyType: 'json' }),
         output: { example: ep.outputExample, schema: ep.outputSchema }
       })
     }
