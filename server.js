@@ -63,8 +63,8 @@ app.get('/', (req, res) => {
         #result { margin-top: 1.25rem; display: none; }
         #result img { width: 100%; border-radius: 10px; border: 1px solid #334155; display: block; }
         .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
-        .actions a, .actions button { display: block; text-align: center; text-decoration: none; padding: 11px 8px; border-radius: 8px; background: #334155; color: #e2e8f0; font-weight: 600; font-size: 0.85rem; border: none; cursor: pointer; font-family: inherit; box-sizing: border-box; }
-        .actions a:hover, .actions button:hover { background: #475569; }
+        .actions button { display: block; text-align: center; padding: 11px 8px; border-radius: 8px; background: #334155; color: #e2e8f0; font-weight: 600; font-size: 0.85rem; border: none; cursor: pointer; font-family: inherit; box-sizing: border-box; }
+        .actions button:hover { background: #475569; }
         .actions .wide { grid-column: 1 / -1; }
         #meta { margin-top: 0.75rem; font-size: 0.75rem; color: #64748b; word-break: break-all; line-height: 1.5; }
         #meta a { color: #38bdf8; }
@@ -82,7 +82,7 @@ app.get('/', (req, res) => {
         <div id="result">
           <img id="image" alt="Generated image" />
           <div class="actions">
-            <a id="saveBtn" href="#" download>Save image</a>
+            <button id="saveBtn" onclick="saveImage()">Save image</button>
             <button id="copyImgBtn" onclick="copyImage()">Copy image</button>
             <button id="copyLinkBtn" class="wide" onclick="copyLink()">Copy shareable link</button>
           </div>
@@ -94,6 +94,7 @@ app.get('/', (req, res) => {
       <script>
         let lastResult = null;
         let pngPromise = null;
+        let pngBlob = null;
         let clipboardBlocked = false;
 
         function randomNonce() {
@@ -115,12 +116,21 @@ app.get('/', (req, res) => {
           const el = document.getElementById('toast');
           el.style.color = bad ? '#ef4444' : '#4ade80';
           el.innerText = msg;
-          setTimeout(() => { if (el.innerText === msg) el.innerText = ''; }, 3000);
+          setTimeout(() => { if (el.innerText === msg) el.innerText = ''; }, 4000);
         }
+
+        function slugify(text) {
+          return (text || 'image').toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'image';
+        }
+
+        const IS_APPLE = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+          (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
         // The clipboard API only accepts PNG, and the model returns webp — so
         // redraw through a canvas. Done eagerly on load, because Safari kills
         // the click's user activation if we await anything before write().
+        // The resolved blob is also kept in pngBlob so saveImage() needs no await.
         function preparePng() {
           const img = document.getElementById('image');
           pngPromise = img.decode().then(() => {
@@ -131,7 +141,46 @@ app.get('/', (req, res) => {
             return new Promise((resolve, reject) =>
               canvas.toBlob(b => (b ? resolve(b) : reject(new Error('encode failed'))), 'image/png')
             );
-          });
+          }).then(blob => { pngBlob = blob; return blob; });
+        }
+
+        function openInTab() {
+          if (!lastResult) return;
+          window.open(lastResult.imageUrl, '_blank');
+          toast('Opened full size — long-press it and choose "Add to Photos"');
+        }
+
+        function saveImage() {
+          if (!lastResult) return;
+          const name = slugify(lastResult.prompt) + '.png';
+
+          if (pngBlob) {
+            const file = new File([pngBlob], name, { type: 'image/png' });
+
+            // iOS ignores the download attribute entirely; the share sheet is
+            // the only real path into Photos.
+            if (IS_APPLE && navigator.canShare && navigator.canShare({ files: [file] })) {
+              navigator.share({ files: [file] })
+                .catch(err => { if (err && err.name !== 'AbortError') openInTab(); });
+              return;
+            }
+
+            // Android and desktop honour a blob URL + download attribute.
+            try {
+              const url = URL.createObjectURL(pngBlob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = name;
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 10000);
+              toast('Saved to your downloads');
+              return;
+            } catch (e) {}
+          }
+
+          openInTab();
         }
 
         function copyImage() {
@@ -148,24 +197,22 @@ app.get('/', (req, res) => {
             .then(() => toast('Image copied to clipboard'))
             .catch(() => {
               clipboardBlocked = true;
-              btn.innerText = 'Share / Save image';
+              btn.innerText = 'Share image';
               toast('Clipboard blocked here — tap again to share', true);
             });
         }
 
         async function shareImage() {
           try {
-            const blob = await pngPromise;
-            const slug = ((lastResult && lastResult.prompt) || 'image')
-              .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-            const file = new File([blob], (slug || 'image') + '.png', { type: 'image/png' });
+            const blob = pngBlob || await pngPromise;
+            const file = new File([blob], slugify(lastResult && lastResult.prompt) + '.png', { type: 'image/png' });
             if (navigator.canShare && navigator.canShare({ files: [file] })) {
               return await navigator.share({ files: [file] });
             }
             throw new Error('unsupported');
           } catch (err) {
             if (err && err.name === 'AbortError') return;
-            toast('Use "Save image", or long-press the image above', true);
+            openInTab();
           }
         }
 
@@ -200,6 +247,7 @@ app.get('/', (req, res) => {
           // Reset per-run state so stale buttons can't act on an old image.
           lastResult = null;
           pngPromise = null;
+          pngBlob = null;
           clipboardBlocked = false;
           document.getElementById('copyImgBtn').innerText = 'Copy image';
 
@@ -366,17 +414,8 @@ app.get('/', (req, res) => {
 
             lastResult = data;
 
-            const ext = (data.mimeType || 'image/webp').split('/')[1] || 'webp';
-            const slug = promptInput.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-
             imgEl.src = 'data:' + (data.mimeType || 'image/webp') + ';base64,' + data.image;
             preparePng();
-
-            // Download from the real endpoint, not the data URL — mobile
-            // browsers handle Content-Disposition far better than data: links.
-            const saveBtn = document.getElementById('saveBtn');
-            saveBtn.href = data.imageUrl + '?download=1';
-            saveBtn.setAttribute('download', (slug || 'image') + '.' + ext);
 
             const tx = settlement && settlement.transaction;
             metaEl.innerHTML = 'Prompt: ' + (data.prompt || '') + '<br>Model: ' + (data.model || '') +
@@ -424,7 +463,8 @@ app.get('/api/v1/image/:id', (req, res) => {
   res.set('Content-Type', entry.mimeType);
   res.set('Cache-Control', 'private, max-age=3600');
   if (req.query.download !== undefined) {
-    const slug = (entry.prompt || 'image').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+    const slug = (entry.prompt || 'image').toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
     res.set('Content-Disposition', `attachment; filename="${slug || 'image'}.${ext}"`);
   }
   res.send(entry.buffer);
