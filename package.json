@@ -11,8 +11,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@coinbase/x402": "^2.1.0",
     "@x402/evm": "^2.20.0",
     "@x402/express": "^2.20.0",
+    "@x402/extensions": "^2.20.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "replicate": "^1.4.0"
