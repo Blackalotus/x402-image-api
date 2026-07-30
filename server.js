@@ -705,5 +705,7 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log(`Server on port ${PORT} — facilitator: ${usingCdp ? 'CDP (Bazaar on)' : 'PayAI (Bazaar off)'}`)
+const facilitatorLabel = usingCdp ? 'CDP (Bazaar on)' : 'PayAI (Bazaar off)';
+app.listen(PORT, function () {
+  console.log('Server on port ' + PORT + ' - facilitator: ' + facilitatorLabel);
+});
