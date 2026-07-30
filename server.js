@@ -9,7 +9,7 @@ app.use(express.json());
 
 const WALLET_ADDRESS = '0x3268C9434D8603957420f04510CA0ff6097A5C64';
 
-// 1. Human UI Homepage Route with Native Web3 Wallet Integration
+// 1. Human UI Homepage Route
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -65,11 +65,9 @@ app.get('/', (req, res) => {
           btn.disabled = true;
 
           try {
-            // Request accounts
             const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
             const userAddress = accounts[0];
 
-            // Switch to Base Mainnet (0x2105 = 8453)
             try {
               await window.ethereum.request({
                 method: 'wallet_switchEthereumChain',
@@ -81,15 +79,14 @@ app.get('/', (req, res) => {
 
             const now = Math.floor(Date.now() / 1000);
             
-            // 32-byte hex nonce
             const array = new Uint8Array(32);
             window.crypto.getRandomValues(array);
             const nonce = '0x' + Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
 
             const authorizationMsg = {
               from: userAddress,
-              to: '${WALLET_ADDRESS}',
-              value: '50000', // $0.05 USDC (6 decimals)
+              to: '0x3268C9434D8603957420f04510CA0ff6097A5C64',
+              value: '50000',
               validAfter: '0',
               validBefore: String(now + 3600),
               nonce: nonce
@@ -122,7 +119,6 @@ app.get('/', (req, res) => {
               message: authorizationMsg
             };
 
-            // Request wallet signature directly via eth_signTypedData_v4
             const signature = await window.ethereum.request({
               method: 'eth_signTypedData_v4',
               params: [userAddress, JSON.stringify(typedData)]
@@ -130,7 +126,6 @@ app.get('/', (req, res) => {
 
             statusDiv.innerText = "3/3 Verifying micropayment with server...";
 
-            // Construct x402 payment header payload
             const x402Payload = {
               x402Version: 2,
               scheme: 'exact',
