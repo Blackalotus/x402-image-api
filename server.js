@@ -1777,6 +1777,9 @@ for (const ep of ENDPOINTS) {
     }],
     description: ep.description,
     mimeType: 'application/json',
+    // The Bazaar rejects a discovery registration without an absolute
+    // resource URL ("resource is required"), even though payment settles fine.
+    resource: `${BASE_URL}${ep.path}`,
     extensions: {
       ...declareDiscoveryExtension({
         input: ep.inputExample,
