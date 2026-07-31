@@ -1355,7 +1355,6 @@ app.get('/', (req, res) => {
         <div class="rs"><div class="l">From</div><div class="v">$${PRICE_PREFLIGHT}</div></div>
         <nav class="rail-nav">
           <a href="#services">Services</a>
-          <a href="#start">Quick start</a>
           <a href="#record">Calibration record</a>
           <a href="#adoption">Adoption</a>
           <a href="#try">Try it</a>
@@ -1366,12 +1365,12 @@ app.get('/', (req, res) => {
 
       <main class="main">
         <div class="eyebrow">Metered access · no accounts</div>
-        <h1>Five services.<br>Priced <em>per call</em>.</h1>
+        <h1>Seven services.<br>Priced <em>per call</em>.</h1>
         <p class="lede">Settled in USDC on Base over the x402 protocol. <b>No key, no account,
           no subscription</b> — a wallet is asked once per request, and the receipt is on-chain.
           Built for agents; usable by anyone with a browser wallet.</p>
         <div class="cta">
-          <a href="#start" class="btn p">Quick start</a>
+          <a href="#services" class="btn p">See the services</a>
           <a href="#record" class="btn s">See the record</a>
         </div>
 
@@ -1380,25 +1379,25 @@ app.get('/', (req, res) => {
           <p class="sd">Every endpoint answers HTTP 402 with its terms. Pay, retry, get the result.
             Selecting a row here also selects it in the panel below.</p>
           <div class="rate" id="rateCard">
-            <div class="row on" data-mode="image">
-              <span class="meth">GET</span><span class="nm">Image generation</span><span class="pr">$${PRICE_IMAGE}</span>
-              <span class="ds">FLUX text-to-image. Returns the bytes plus a durable URL.</span>
-              <span class="pt">/api/v1/generate-image</span>
-            </div>
-            <div class="row" data-mode="pdf">
-              <span class="meth">POST</span><span class="nm">PDF to Markdown</span><span class="pr">$${PRICE_PDF}</span>
-              <span class="ds">Text-layer extraction, unwrapped into clean Markdown with headings and lists.</span>
-              <span class="pt">/api/v1/pdf-to-markdown</span>
-            </div>
-            <div class="row" data-mode="video">
+            <div class="row on" data-mode="video">
               <span class="meth">POST</span><span class="nm">Video generation</span><span class="pr">$${PRICE_VIDEO}</span>
               <span class="ds">Text-to-video or image-to-video at 1080p. Returns a job id; the MP4 lands on a durable URL.</span>
               <span class="pt">/api/v1/video</span>
+            </div>
+            <div class="row" data-mode="image">
+              <span class="meth">GET</span><span class="nm">Image generation</span><span class="pr">$${PRICE_IMAGE}</span>
+              <span class="ds">FLUX text-to-image. Returns the bytes plus a durable URL.</span>
+              <span class="pt">/api/v1/generate-image</span>
             </div>
             <div class="row" data-mode="transcribe">
               <span class="meth">POST</span><span class="nm">Transcription</span><span class="pr">$${PRICE_TRANSCRIBE}</span>
               <span class="ds">Audio or video to timestamped text. Podcasts, meetings, earnings calls.</span>
               <span class="pt">/api/v1/transcribe</span>
+            </div>
+            <div class="row" data-mode="pdf">
+              <span class="meth">POST</span><span class="nm">PDF to Markdown</span><span class="pr">$${PRICE_PDF}</span>
+              <span class="ds">Text-layer extraction, unwrapped into clean Markdown with headings and lists.</span>
+              <span class="pt">/api/v1/pdf-to-markdown</span>
             </div>
             <div class="row" data-mode="preflight">
               <span class="meth">GET</span><span class="nm">Gas preflight</span><span class="pr">$${PRICE_PREFLIGHT}</span>
@@ -1418,45 +1417,8 @@ app.get('/', (req, res) => {
           </div>
         </section>
 
-        <section id="start">
-          <div class="sl"><span class="n">02</span><h2>Quick start</h2></div>
-          <p class="sd">Three steps. Nothing to provision — the 402 response carries everything
-            a client needs in order to pay.</p>
-          <div class="steps">
-            <div class="step"><div class="i">01</div><h3>Ask</h3>
-              <p>Call the endpoint with no payment header. You get 402 and the terms in a header.</p></div>
-            <div class="step"><div class="i">02</div><h3>Sign</h3>
-              <p>Sign an EIP-3009 USDC authorization for exactly the amount quoted.</p></div>
-            <div class="step"><div class="i">03</div><h3>Retry</h3>
-              <p>Send it back as PAYMENT-SIGNATURE. Settlement and the result arrive together.</p></div>
-          </div>
-
-          <div class="code">
-            <div class="code-h"><span>Read the terms — free</span><button onclick="copyCode(this)">Copy</button></div>
-<pre data-raw="curl -i ${BASE_URL}/api/v1/gas/preflight"><span class="c"># An unpaid request returns the price, the asset and the network</span>
-<span class="k">curl</span> -i <span class="s">${BASE_URL}/api/v1/gas/preflight</span>
-
-<span class="c"># HTTP/2 402</span>
-<span class="c"># payment-required: eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0cyI6W3si...</span></pre>
-          </div>
-
-          <div class="code">
-            <div class="code-h"><span>Or let a client handle the handshake</span><button onclick="copyCode(this)">Copy</button></div>
-<pre data-raw="import { wrapFetchWithPayment } from '@x402/fetch';
-
-const pay = wrapFetchWithPayment(fetch, wallet);
-const res = await pay('${BASE_URL}/api/v1/gas/preflight');
-const { forecast } = await res.json();"><span class="k">import</span> { wrapFetchWithPayment } <span class="k">from</span> <span class="s">'@x402/fetch'</span>;
-
-<span class="k">const</span> <span class="w">pay</span> = wrapFetchWithPayment(fetch, wallet);
-<span class="k">const</span> <span class="w">res</span> = <span class="k">await</span> pay(<span class="s">'${BASE_URL}/api/v1/gas/preflight'</span>);
-<span class="k">const</span> { forecast } = <span class="k">await</span> res.json();
-<span class="c">// { lowGwei: 0.0106, centerGwei: 0.0139, highGwei: 0.0182 }</span></pre>
-          </div>
-        </section>
-
         <section id="record">
-          <div class="sl"><span class="n">03</span><h2>Calibration record</h2><span class="r" id="calScope"></span></div>
+          <div class="sl"><span class="n">02</span><h2>Calibration record</h2><span class="r" id="calScope"></span></div>
           <p class="sd">Anyone can publish a forecast. This is the part that can be checked: every
             journalled decision is resolved against the base fee at its target block, and the
             misses are published alongside the hits.</p>
@@ -1464,7 +1426,7 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
         </section>
 
         <section id="adoption">
-          <div class="sl"><span class="n">04</span><h2>Adoption</h2><span class="r" id="adScope"></span></div>
+          <div class="sl"><span class="n">03</span><h2>Adoption</h2><span class="r" id="adScope"></span></div>
           <p class="sd">Cumulative calls and distinct paying wallets, one point per day since the
             first payment. These are wallets that settled, not a count of agents — nothing
             on-chain distinguishes an autonomous agent from a person holding a wallet.</p>
@@ -1482,11 +1444,11 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
         </section>
 
         <section id="try">
-          <div class="sl"><span class="n">05</span><h2>Try it</h2></div>
+          <div class="sl"><span class="n">04</span><h2>Try it</h2></div>
           <p class="sd">Runs against the live API from your browser wallet. Real USDC, real
             settlement — the smallest call costs $${PRICE_PREFLIGHT}.</p>
 
-          <div id="f_image">
+          <div id="f_image" class="hidden">
             <div class="field"><label class="cap" for="prompt">Prompt</label>
               <input type="text" id="prompt" placeholder="a harbour crane at dawn, long exposure"></div>
           </div>
@@ -1497,7 +1459,7 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
               <input type="file" id="pdfFile" accept="application/pdf">
               <div class="hint">20 MB ceiling. Scanned PDFs carry no text layer and return empty.</div></div>
           </div>
-          <div id="f_video" class="hidden">
+          <div id="f_video">
             <div class="field"><label class="cap" for="vPrompt">Prompt</label>
               <input type="text" id="vPrompt" placeholder="a paper boat drifting down a rain-filled gutter"></div>
             <div class="field"><label class="cap" for="vImage">Starting image URL — optional</label>
@@ -1534,7 +1496,7 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
           </div>
 
           <button class="run" id="btn" onclick="run()">
-            <span>Run</span><span id="btnAmt">$${PRICE_IMAGE}</span></button>
+            <span>Run</span><span id="btnAmt">$${PRICE_VIDEO}</span></button>
 
           <div class="ladder" id="ladder">
             <div class="rung" data-step="1"><span>1</span><span class="tr"></span><span class="st">Read terms</span></div>
@@ -1642,7 +1604,7 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
             'It may still finish. Check '+window.location.origin+'/api/v1/jobs/'+jobId);
         }
       }
-      let mode='image',lastResult=null,lastText='',pngPromise=null,pngBlob=null,clipboardBlocked=false;
+      let mode='video',lastResult=null,lastText='',pngPromise=null,pngBlob=null,clipboardBlocked=false;
       const $=id=>document.getElementById(id);
 
       document.querySelectorAll('#rateCard .row').forEach(row=>{
