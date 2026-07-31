@@ -41,6 +41,18 @@ const PRICE_PDF = process.env.PRICE_PDF || '0.005';
 const PRICE_PREFLIGHT = process.env.PRICE_PREFLIGHT || '0.002';
 const PRICE_DECISION = process.env.PRICE_DECISION || '0.003';
 const PRICE_AUDIT = process.env.PRICE_AUDIT || '0.002';
+const PRICE_VIDEO = process.env.PRICE_VIDEO || '1.50';
+const PRICE_TRANSCRIBE = process.env.PRICE_TRANSCRIBE || '1.50';
+
+// Model slugs are env-configurable because Replicate's catalogue and pricing
+// move. Set these to whatever you have actually checked the price of.
+// An official model is "owner/name"; a community model is "owner/name:versionhash".
+const REPLICATE_VIDEO_MODEL = process.env.REPLICATE_VIDEO_MODEL || 'prunaai/p-video';
+const VIDEO_RESOLUTION = process.env.VIDEO_RESOLUTION || '1080p';
+const REPLICATE_AUDIO_MODEL = process.env.REPLICATE_AUDIO_MODEL || 'openai/whisper';
+
+const JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000;   // job records kept a week
+const AUDIO_MAX_BYTES = 200 * 1024 * 1024;
 
 const PDF_MAX_BYTES = 20 * 1024 * 1024;
 const PDF_FETCH_TIMEOUT_MS = 30000;
@@ -159,6 +171,114 @@ const ENDPOINTS = [
         characters: { type: 'number' },
         title: { type: 'string' },
         markdown: { type: 'string' }
+      }
+    }
+  },
+  {
+    method: 'POST',
+    path: '/api/v1/video',
+    price: PRICE_VIDEO,
+    operationId: 'generateVideo',
+    summary: 'Generate a short video from a prompt or a starting image',
+    tags: ['Media'],
+    description:
+      'Text-to-video and image-to-video generation at 1080p, up to five seconds. Returns a job id ' +
+      'immediately; poll the free ' +
+      'status endpoint until it completes, then collect an MP4 stored on a durable URL. ' +
+      'Generation typically takes one to three minutes. No API key or account needed.',
+    requestBody: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: {
+            type: 'object',
+            properties: {
+              prompt: { type: 'string', description: 'What the video should show' },
+              imageUrl: { type: 'string', description: 'Optional starting frame for image-to-video' },
+              durationSeconds: { type: 'integer', minimum: 3, maximum: 5, default: 5 }
+            },
+            required: ['prompt']
+          },
+          example: { prompt: 'a paper boat drifting down a rain-filled gutter', durationSeconds: 5 }
+        }
+      }
+    },
+    inputExample: { prompt: 'a paper boat drifting down a rain-filled gutter', durationSeconds: 5 },
+    inputSchema: {
+      properties: {
+        prompt: { type: 'string', description: 'What the video should show' },
+        imageUrl: { type: 'string', description: 'Optional starting frame for image-to-video' },
+        durationSeconds: { type: 'integer', description: 'Clip length in seconds, 3 to 5' }
+      },
+      required: ['prompt']
+    },
+    outputExample: {
+      success: true, status: 'processing',
+      jobId: '3f9a2c1b4d6e8f0a1b2c3d4e5f607182',
+      statusUrl: `${BASE_URL}/api/v1/jobs/3f9a2c1b4d6e8f0a1b2c3d4e5f607182`,
+      pollAfterSeconds: 20
+    },
+    outputSchema: {
+      properties: {
+        success: { type: 'boolean' },
+        status: { type: 'string', enum: ['processing'] },
+        jobId: { type: 'string' },
+        statusUrl: { type: 'string', description: 'Free endpoint; poll until status is completed' },
+        pollAfterSeconds: { type: 'number' }
+      }
+    }
+  },
+  {
+    method: 'POST',
+    path: '/api/v1/transcribe',
+    price: PRICE_TRANSCRIBE,
+    operationId: 'transcribeAudio',
+    summary: 'Transcribe audio or video into timestamped text',
+    tags: ['Data'],
+    description:
+      'Speech-to-text with timestamped segments, for recordings an agent cannot listen to ' +
+      'directly: podcasts, meetings, earnings calls, lecture audio. Give a public URL to an ' +
+      'audio or video file. Returns a job id immediately; poll the free status endpoint for the ' +
+      'transcript. Handles files up to several hours. No API key or account needed.',
+    requestBody: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: {
+            type: 'object',
+            properties: {
+              audioUrl: { type: 'string', description: 'Public URL of an audio or video file' },
+              language: { type: 'string', description: 'ISO code such as en; omit to auto-detect' },
+              translate: { type: 'boolean', description: 'Translate the transcript into English' }
+            },
+            required: ['audioUrl']
+          },
+          example: { audioUrl: 'https://example.com/earnings-call.mp3' }
+        }
+      }
+    },
+    inputExample: { audioUrl: 'https://example.com/earnings-call.mp3' },
+    inputSchema: {
+      properties: {
+        audioUrl: { type: 'string', description: 'Public URL of an audio or video file' },
+        language: { type: 'string', description: 'ISO code such as en; omit to auto-detect' },
+        translate: { type: 'boolean', description: 'Translate the transcript into English' }
+      },
+      required: ['audioUrl']
+    },
+    outputExample: {
+      success: true, status: 'processing',
+      jobId: '8c2d1e4f6a9b0c3d5e7f8091a2b3c4d5',
+      statusUrl: `${BASE_URL}/api/v1/jobs/8c2d1e4f6a9b0c3d5e7f8091a2b3c4d5`,
+      pollAfterSeconds: 15
+    },
+    outputSchema: {
+      properties: {
+        success: { type: 'boolean' },
+        status: { type: 'string', enum: ['processing'] },
+        jobId: { type: 'string' },
+        statusUrl: { type: 'string' },
+        pollAfterSeconds: { type: 'number' }
       }
     }
   },
@@ -585,6 +705,116 @@ await loadStats();
 setInterval(flushStats, 15000).unref();
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, async () => { await flushStats(); process.exit(0); });
+}
+
+// ---------------------------------------------------------------------------
+// Long-running jobs.
+//
+// Video and transcription take minutes, which is far longer than any HTTP
+// client — or agent — will hold a connection. So the paid call starts the work
+// and returns a job id immediately; a free status endpoint reports progress.
+//
+// Progress is checked lazily, when someone asks, rather than by a background
+// worker. On a single instance that is simpler and cannot drift.
+// ---------------------------------------------------------------------------
+const jobMemory = new Map();
+
+async function storeJob(job) {
+  job.updatedAt = new Date().toISOString();
+  jobMemory.set(job.id, job);
+  if (!r2) return;
+  try {
+    await r2.send(new PutObjectCommand({
+      Bucket: R2_BUCKET, Key: `jobs/${job.id}.json`,
+      Body: Buffer.from(JSON.stringify(job)), ContentType: 'application/json'
+    }));
+  } catch (err) {
+    console.error('[jobs] write failed:', err.message);
+  }
+}
+
+async function loadJob(id) {
+  if (jobMemory.has(id)) return jobMemory.get(id);
+  if (!r2) return null;
+  try {
+    const result = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: `jobs/${id}.json` }));
+    const job = JSON.parse(Buffer.from(await result.Body.transformToByteArray()).toString('utf8'));
+    jobMemory.set(id, job);
+    return job;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Generic asset store. Unlike the image store this records the content type on
+// the object itself, so retrieval needs no extension guessing.
+async function storeAsset(buffer, contentType) {
+  const id = crypto.randomBytes(16).toString('hex');
+  if (r2) {
+    await r2.send(new PutObjectCommand({
+      Bucket: R2_BUCKET, Key: `assets/${id}`, Body: buffer, ContentType: contentType
+    }));
+  } else {
+    hotSet('asset:' + id, { buffer, mimeType: contentType, prompt: 'asset' });
+  }
+  return id;
+}
+
+async function loadAsset(id) {
+  const hot = hotCache.get('asset:' + id);
+  if (hot) return hot;
+  if (!r2) return null;
+  try {
+    const result = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: `assets/${id}` }));
+    return {
+      buffer: Buffer.from(await result.Body.transformToByteArray()),
+      mimeType: result.ContentType || 'application/octet-stream'
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+// Replicate accepts two different shapes: official models are addressed by
+// name, community models by version hash. Support both so the model slug can
+// be swapped by env var without a code change.
+async function replicateStart(model, input) {
+  if (!REPLICATE_TOKEN) throw new Error('REPLICATE_API_TOKEN is not set on the server');
+  const headers = {
+    Authorization: `Bearer ${REPLICATE_TOKEN}`,
+    'Content-Type': 'application/json'
+  };
+
+  const isVersioned = model.includes(':');
+  const url = isVersioned
+    ? 'https://api.replicate.com/v1/predictions'
+    : `https://api.replicate.com/v1/models/${model}/predictions`;
+  const body = isVersioned
+    ? { version: model.split(':')[1], input }
+    : { input };
+
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`Replicate ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  return res.json();
+}
+
+async function replicateGet(predictionId) {
+  const res = await fetch(`https://api.replicate.com/v1/predictions/${predictionId}`, {
+    headers: { Authorization: `Bearer ${REPLICATE_TOKEN}` }
+  });
+  if (!res.ok) throw new Error(`Replicate poll ${res.status}`);
+  return res.json();
+}
+
+function firstUrl(output) {
+  if (typeof output === 'string') return output;
+  if (Array.isArray(output)) return output.find(o => typeof o === 'string') || null;
+  if (output && typeof output === 'object') {
+    for (const k of ['video', 'url', 'output', 'mp4']) {
+      if (typeof output[k] === 'string') return output[k];
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,6 +1390,16 @@ app.get('/', (req, res) => {
               <span class="ds">Text-layer extraction, unwrapped into clean Markdown with headings and lists.</span>
               <span class="pt">/api/v1/pdf-to-markdown</span>
             </div>
+            <div class="row" data-mode="video">
+              <span class="meth">POST</span><span class="nm">Video generation</span><span class="pr">$${PRICE_VIDEO}</span>
+              <span class="ds">Text-to-video or image-to-video at 1080p. Returns a job id; the MP4 lands on a durable URL.</span>
+              <span class="pt">/api/v1/video</span>
+            </div>
+            <div class="row" data-mode="transcribe">
+              <span class="meth">POST</span><span class="nm">Transcription</span><span class="pr">$${PRICE_TRANSCRIBE}</span>
+              <span class="ds">Audio or video to timestamped text. Podcasts, meetings, earnings calls.</span>
+              <span class="pt">/api/v1/transcribe</span>
+            </div>
             <div class="row" data-mode="preflight">
               <span class="meth">GET</span><span class="nm">Gas preflight</span><span class="pr">$${PRICE_PREFLIGHT}</span>
               <span class="ds">Current Base fee, recent percentiles, realised volatility, and an 80% forecast range.</span>
@@ -1257,6 +1497,22 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
               <input type="file" id="pdfFile" accept="application/pdf">
               <div class="hint">20 MB ceiling. Scanned PDFs carry no text layer and return empty.</div></div>
           </div>
+          <div id="f_video" class="hidden">
+            <div class="field"><label class="cap" for="vPrompt">Prompt</label>
+              <input type="text" id="vPrompt" placeholder="a paper boat drifting down a rain-filled gutter"></div>
+            <div class="field"><label class="cap" for="vImage">Starting image URL — optional</label>
+              <input type="text" id="vImage" placeholder="https://example.com/frame.jpg"></div>
+            <div class="field"><label class="cap" for="vDur">Duration · seconds</label>
+              <input type="number" id="vDur" value="5" min="3" max="5">
+              <div class="hint">Runs as a background job. Usually one to three minutes.</div></div>
+          </div>
+          <div id="f_transcribe" class="hidden">
+            <div class="field"><label class="cap" for="aUrl">Audio or video URL</label>
+              <input type="text" id="aUrl" placeholder="https://example.com/earnings-call.mp3"></div>
+            <div class="field"><label class="cap" for="aLang">Language — optional</label>
+              <input type="text" id="aLang" placeholder="en · leave blank to auto-detect">
+              <div class="hint">200 MB ceiling. Roughly one minute of processing per hour of audio.</div></div>
+          </div>
           <div id="f_preflight" class="hidden">
             <div class="field"><label class="cap" for="horizon1">Horizon · minutes</label>
               <input type="number" id="horizon1" value="5" min="1" max="60"></div>
@@ -1297,6 +1553,9 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
               <div class="band" id="band"></div>
             </div>
             <img id="image" alt="" class="hidden">
+            <video id="video" class="hidden" controls playsinline
+              style="width:100%;display:block;border:1px solid var(--rule);background:#000"></video>
+            <div id="jobBox" class="hidden"></div>
             <pre class="data hidden" id="data"></pre>
             <div class="acts hidden" id="imageActs">
               <button onclick="saveImage()">Save</button>
@@ -1325,7 +1584,64 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
     <script>
       const PRICE={image:'${PRICE_IMAGE}',pdf:'${PRICE_PDF}',preflight:'${PRICE_PREFLIGHT}',
         decision:'${PRICE_DECISION}',audit:'${PRICE_AUDIT}'};
-      const MODES=['image','pdf','preflight','decision','audit'];
+      const MODES=['image','pdf','video','transcribe','preflight','decision','audit'];
+
+      // Jobs run in the background. Poll the free status endpoint until it
+      // resolves, showing elapsed time so a long wait doesn't look like a hang.
+      let jobTimer=null;
+      function stopPolling(){if(jobTimer){clearTimeout(jobTimer);jobTimer=null;}}
+
+      function jobLine(label,extra){
+        return '<div style="border:1px solid var(--rule);background:var(--panel);padding:16px;'+
+          'font-family:var(--mono);font-size:12.5px;line-height:1.7">'+label+
+          (extra?'<div style="color:var(--faint);margin-top:6px">'+extra+'</div>':'')+'</div>';
+      }
+
+      async function pollJob(jobId,kind,startedAt){
+        const box=$('jobBox');
+        box.classList.remove('hidden');
+        try{
+          const r=await fetch('/api/v1/jobs/'+jobId);
+          const j=await r.json();
+          const secs=Math.round((Date.now()-startedAt)/1000);
+
+          if(j.status==='processing'){
+            box.innerHTML=jobLine(
+              '<span style="color:var(--amber)">Working…</span> '+secs+'s elapsed',
+              'Job '+jobId+' · polling is free · this page will update itself');
+            jobTimer=setTimeout(()=>pollJob(jobId,kind,startedAt),(j.pollAfterSeconds||15)*1000);
+            return;
+          }
+
+          if(j.status==='failed'){
+            box.innerHTML=jobLine('<span style="color:var(--red)">Job failed.</span> '+
+              (j.error||''),'You were charged. Quote job '+jobId+' for a credit.');
+            return;
+          }
+
+          // completed
+          if(kind==='video'){
+            const v=$('video');
+            v.src=j.result.videoUrl;v.classList.remove('hidden');
+            lastResult={absoluteUrl:j.result.videoUrl,prompt:'video'};
+            box.innerHTML=jobLine('<span style="color:var(--teal)">Done</span> in '+secs+'s',
+              Math.round(j.result.sizeBytes/1024)+' KB · '+j.result.model);
+            $('textActs').classList.add('hidden');
+            $('imageActs').classList.add('hidden');
+            $('meta').innerHTML='<a href="'+j.result.videoUrl+'" target="_blank" rel="noopener">'+
+              'Open the MP4</a>';
+          }else{
+            const t=j.result.text||'(no speech detected)';
+            showData(t);
+            box.innerHTML=jobLine('<span style="color:var(--teal)">Done</span> in '+secs+'s',
+              j.result.characters+' characters · '+(j.result.segments||[]).length+' segments'+
+              (j.result.detectedLanguage?' · '+j.result.detectedLanguage:''));
+          }
+        }catch(e){
+          box.innerHTML=jobLine('<span style="color:var(--red)">Lost contact with the job.</span>',
+            'It may still finish. Check '+window.location.origin+'/api/v1/jobs/'+jobId);
+        }
+      }
       let mode='image',lastResult=null,lastText='',pngPromise=null,pngBlob=null,clipboardBlocked=false;
       const $=id=>document.getElementById(id);
 
@@ -1664,9 +1980,12 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
         if(!window.ethereum){resetLadder();
           return fail('No wallet found in this browser. Open this page inside MetaMask, Coinbase Wallet, or Phantom.');}
 
+        stopPolling();
         lastResult=null;lastText='';pngPromise=null;pngBlob=null;clipboardBlocked=false;
         $('copyImgBtn').textContent='Copy image';
         $('out').classList.remove('show');$('meter').classList.add('hidden');
+        $('video').classList.add('hidden');$('video').removeAttribute('src');
+        $('jobBox').classList.add('hidden');$('jobBox').innerHTML='';
         $('meterVerdict').className='vd';$('meterVerdict').textContent='';
         failBox.classList.remove('show');resetLadder();btn.disabled=true;
         const step=n=>markStep(n);
@@ -1692,6 +2011,28 @@ const { forecast } = await res.json();"><span class="k">import</span> { wrapFetc
             showData(r.data.markdown||'(no text layer found — this is probably a scan)');
             metaHtml=r.data.pages+' pages · '+r.data.characters+' characters'+
               (r.data.title?' · '+r.data.title:'');
+          }else if(mode==='video'){
+            const p=$('vPrompt').value.trim();
+            if(!p)throw new Error('Enter a prompt first.');
+            const body={prompt:p,durationSeconds:Math.max(3,Math.min(5,Number($('vDur').value)||5))};
+            const img=$('vImage').value.trim();
+            if(img)body.imageUrl=img;
+            const r=await paidCall('POST','/api/v1/video',body,step);
+            settlement=r.settlement;
+            $('out').classList.add('show');
+            pollJob(r.data.jobId,'video',Date.now());
+            metaHtml='Job '+r.data.jobId;
+          }else if(mode==='transcribe'){
+            const u=$('aUrl').value.trim();
+            if(!u)throw new Error('Give a public audio or video URL.');
+            const body={audioUrl:u};
+            const lang=$('aLang').value.trim();
+            if(lang)body.language=lang;
+            const r=await paidCall('POST','/api/v1/transcribe',body,step);
+            settlement=r.settlement;
+            $('out').classList.add('show');
+            pollJob(r.data.jobId,'transcribe',Date.now());
+            metaHtml='Job '+r.data.jobId;
           }else if(mode==='preflight'){
             const h=Math.max(1,Math.min(60,Number($('horizon1').value)||5));
             const r=await paidCall('GET','/api/v1/gas/preflight?horizonMinutes='+h,null,step);
@@ -2005,6 +2346,109 @@ app.get('/api/v1/pulse', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// 4c. Job status and asset retrieval — free, before the payment middleware.
+//
+//     The work was already paid for when the job was created. Charging again
+//     to collect the result would be indefensible, and would also mean an
+//     agent pays every time it polls.
+// ---------------------------------------------------------------------------
+app.get('/api/v1/jobs/:id', async (req, res) => {
+  if (!/^[a-f0-9]{32}$/.test(req.params.id)) {
+    return res.status(400).json({ error: 'Malformed job id' });
+  }
+
+  const job = await loadJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found. Jobs are kept for seven days.' });
+
+  // Lazy progress check: only talk to Replicate when someone is actually asking.
+  if (job.status === 'processing' && job.predictionId) {
+    try {
+      const p = await replicateGet(job.predictionId);
+
+      if (p.status === 'succeeded') {
+        if (job.kind === 'video') {
+          const url = firstUrl(p.output);
+          if (!url) throw new Error('Model returned no video URL');
+          const file = await fetch(url);
+          if (!file.ok) throw new Error(`Could not download the video: ${file.status}`);
+          const buffer = Buffer.from(await file.arrayBuffer());
+          const assetId = await storeAsset(buffer, file.headers.get('content-type') || 'video/mp4');
+          job.status = 'completed';
+          job.result = {
+            videoUrl: `${BASE_URL}/api/v1/asset/${assetId}`,
+            sizeBytes: buffer.length,
+            mimeType: file.headers.get('content-type') || 'video/mp4',
+            model: job.model
+          };
+          console.log(`[video] job ${job.id} done, ${Math.round(buffer.length / 1024)} KB`);
+        } else {
+          const out = p.output || {};
+          const text = typeof out === 'string' ? out : (out.transcription || out.text || '');
+          const segments = Array.isArray(out.segments)
+            ? out.segments.map(s => ({
+                start: s.start, end: s.end, text: (s.text || '').trim()
+              }))
+            : [];
+          job.status = 'completed';
+          job.result = {
+            text,
+            characters: text.length,
+            segments,
+            detectedLanguage: out.detected_language || out.language || null,
+            model: job.model
+          };
+          console.log(`[transcribe] job ${job.id} done, ${text.length} chars`);
+        }
+        await storeJob(job);
+
+      } else if (p.status === 'failed' || p.status === 'canceled') {
+        job.status = 'failed';
+        job.error = p.error || `Model run ${p.status}`;
+        await storeJob(job);
+        console.error(`[jobs] ${job.id} failed:`, job.error);
+      }
+    } catch (err) {
+      console.error('[jobs] progress check failed:', err.message);
+      // Leave the job processing — a transient Replicate error shouldn't kill it.
+    }
+  }
+
+  const age = Date.now() - new Date(job.createdAt).getTime();
+  const payload = {
+    success: job.status !== 'failed',
+    jobId: job.id,
+    kind: job.kind,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    ageSeconds: Math.round(age / 1000)
+  };
+  if (job.status === 'processing') payload.pollAfterSeconds = job.kind === 'video' ? 20 : 15;
+  if (job.status === 'completed') payload.result = job.result;
+  if (job.status === 'failed') {
+    payload.error = job.error;
+    payload.note = 'This job was paid for and did not deliver. Quote the job id for a credit.';
+  }
+  res.json(payload);
+});
+
+app.get('/api/v1/asset/:id', async (req, res) => {
+  if (!/^[a-f0-9]{32}$/.test(req.params.id)) {
+    return res.status(400).json({ error: 'Malformed asset id' });
+  }
+  const asset = await loadAsset(req.params.id);
+  if (!asset) return res.status(404).json({ error: 'Asset not found' });
+
+  res.set('Content-Type', asset.mimeType);
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.set('Accept-Ranges', 'bytes');
+  if (req.query.download !== undefined) {
+    res.set('Content-Disposition', 'attachment');
+  }
+  res.send(asset.buffer);
+});
+
+// ---------------------------------------------------------------------------
 // 5. Diagnostics, then route protection
 // ---------------------------------------------------------------------------
 app.use('/api', (req, res, next) => {
@@ -2186,6 +2630,105 @@ app.post('/api/v1/pdf-to-markdown', async (req, res) => {
   } catch (err) {
     console.error('[pdf] FAILED AFTER PAYMENT:', url || '(uploaded bytes)', err.message);
     res.status(502).json({ error: 'Payment settled but conversion failed: ' + err.message });
+  }
+});
+
+app.post('/api/v1/video', async (req, res) => {
+  const { prompt, imageUrl, durationSeconds } = req.body || {};
+  const text = (prompt || '').toString().trim();
+  if (!text) return res.status(400).json({ error: 'Missing prompt' });
+
+  try {
+    if (imageUrl) await assertPublicUrl(imageUrl);
+
+    const input = {
+      prompt: text,
+      duration: Math.max(3, Math.min(5, Number(durationSeconds) || 5)),
+      resolution: VIDEO_RESOLUTION,
+      // The model ships with disable_safety_filter defaulting to true. This is
+      // a public endpoint any agent can call with any prompt, so turn the
+      // filter back on rather than run an unfiltered generator on our account.
+      disable_safety_filter: false
+    };
+    if (imageUrl) input.image = imageUrl;
+
+    const prediction = await replicateStart(REPLICATE_VIDEO_MODEL, input);
+
+    const job = {
+      id: crypto.randomBytes(16).toString('hex'),
+      kind: 'video',
+      status: 'processing',
+      createdAt: new Date().toISOString(),
+      predictionId: prediction.id,
+      model: REPLICATE_VIDEO_MODEL,
+      params: { prompt: text, imageUrl: imageUrl || null, durationSeconds: input.duration }
+    };
+    await storeJob(job);
+    console.log(`[video] job ${job.id} started (${prediction.id})`);
+
+    res.json({
+      success: true,
+      status: 'processing',
+      jobId: job.id,
+      statusUrl: `${BASE_URL}/api/v1/jobs/${job.id}`,
+      pollAfterSeconds: 20,
+      note: 'Polling the status URL is free. Video generation usually takes one to three minutes.'
+    });
+  } catch (err) {
+    console.error('[video] FAILED AFTER PAYMENT:', err.message);
+    res.status(502).json({ error: 'Payment settled but the job could not be started: ' + err.message });
+  }
+});
+
+app.post('/api/v1/transcribe', async (req, res) => {
+  const { audioUrl, language, translate } = req.body || {};
+  if (!audioUrl) return res.status(400).json({ error: 'Missing audioUrl' });
+
+  try {
+    await assertPublicUrl(audioUrl);
+
+    // A cheap HEAD first, so an obviously oversized file fails before we spend
+    // GPU time on it.
+    try {
+      const head = await fetch(audioUrl, { method: 'HEAD' });
+      const len = Number(head.headers.get('content-length') || 0);
+      if (len && len > AUDIO_MAX_BYTES) {
+        throw new Error(`That file is ${Math.round(len / 1048576)} MB; the limit is 200 MB`);
+      }
+    } catch (e) {
+      if (/limit is 200 MB/.test(e.message)) throw e;
+      // Some hosts refuse HEAD. Carry on and let the model decide.
+    }
+
+    const input = { audio: audioUrl };
+    if (language) input.language = language;
+    if (translate) input.translate = true;
+
+    const prediction = await replicateStart(REPLICATE_AUDIO_MODEL, input);
+
+    const job = {
+      id: crypto.randomBytes(16).toString('hex'),
+      kind: 'transcribe',
+      status: 'processing',
+      createdAt: new Date().toISOString(),
+      predictionId: prediction.id,
+      model: REPLICATE_AUDIO_MODEL,
+      params: { audioUrl, language: language || null, translate: Boolean(translate) }
+    };
+    await storeJob(job);
+    console.log(`[transcribe] job ${job.id} started (${prediction.id})`);
+
+    res.json({
+      success: true,
+      status: 'processing',
+      jobId: job.id,
+      statusUrl: `${BASE_URL}/api/v1/jobs/${job.id}`,
+      pollAfterSeconds: 15,
+      note: 'Polling the status URL is free. Expect roughly one minute per hour of audio.'
+    });
+  } catch (err) {
+    console.error('[transcribe] FAILED AFTER PAYMENT:', err.message);
+    res.status(502).json({ error: 'Payment settled but the job could not be started: ' + err.message });
   }
 });
 
