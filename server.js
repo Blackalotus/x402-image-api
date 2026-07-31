@@ -441,6 +441,153 @@ async function loadDecision(id) {
 }
 
 // ---------------------------------------------------------------------------
+// Public stats: calls served and the calibration record.
+//
+// Kept as one small JSON object in R2 rather than by listing decision records,
+// because listing and reading every decision on each page load would be slow
+// and would burn R2 operations. Held in memory, flushed on a timer.
+// ---------------------------------------------------------------------------
+const STATS_KEY = 'stats/index.json';
+const RECENT_MAX = 40;      // marks shown on the calibration strip
+const ERRORS_MAX = 200;     // sample retained for the median error
+
+let stats = {
+  since: new Date().toISOString(),
+  callsServed: 0,
+  byEndpoint: {},
+  // Distinct wallet addresses that have paid. Pulled from the EIP-3009
+  // authorization, so it is exactly who settled — no inference about whether
+  // a given wallet belongs to an agent or a person, because that is not
+  // knowable from the chain.
+  payers: [],
+  // One bucket per UTC day, so the adoption chart can be drawn from real
+  // history rather than a projection.
+  daily: {},
+  calibration: { resolved: 0, contained: 0, absErrors: [], recent: [] }
+};
+let statsDirty = false;
+
+async function loadStats() {
+  if (!r2) return;
+  try {
+    const result = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: STATS_KEY }));
+    const text = Buffer.from(await result.Body.transformToByteArray()).toString('utf8');
+    const saved = JSON.parse(text);
+    stats = {
+      since: saved.since || stats.since,
+      callsServed: saved.callsServed || 0,
+      byEndpoint: saved.byEndpoint || {},
+      payers: saved.payers || [],
+      daily: saved.daily || {},
+      calibration: {
+        resolved: saved.calibration?.resolved || 0,
+        contained: saved.calibration?.contained || 0,
+        absErrors: saved.calibration?.absErrors || [],
+        recent: saved.calibration?.recent || []
+      }
+    };
+    console.log(`[stats] loaded: ${stats.callsServed} calls, ${stats.calibration.resolved} forecasts resolved`);
+  } catch (err) {
+    const notFound = err.name === 'NoSuchKey' ||
+      (err.$metadata && err.$metadata.httpStatusCode === 404);
+    if (notFound) console.log('[stats] no saved stats yet, starting fresh');
+    else console.error('[stats] load failed:', err.name, err.message);
+  }
+}
+
+async function flushStats() {
+  if (!statsDirty || !r2) return;
+  statsDirty = false;
+  try {
+    await r2.send(new PutObjectCommand({
+      Bucket: R2_BUCKET, Key: STATS_KEY,
+      Body: Buffer.from(JSON.stringify(stats)),
+      ContentType: 'application/json'
+    }));
+  } catch (err) {
+    statsDirty = true;                       // retry on the next tick
+    console.error('[stats] flush failed:', err.message);
+  }
+}
+
+const PAYERS_MAX = 5000;
+const DAILY_MAX = 3700;    // roughly ten years of daily buckets
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function recordCall(route, payer) {
+  stats.callsServed += 1;
+  stats.byEndpoint[route] = (stats.byEndpoint[route] || 0) + 1;
+
+  let newPayer = false;
+  if (payer) {
+    const addr = String(payer).toLowerCase();
+    if (/^0x[a-f0-9]{40}$/.test(addr) && !stats.payers.includes(addr)) {
+      stats.payers.push(addr);
+      if (stats.payers.length > PAYERS_MAX) stats.payers.shift();
+      newPayer = true;
+    }
+  }
+
+  const day = today();
+  const bucket = stats.daily[day] || { calls: 0, newPayers: 0 };
+  bucket.calls += 1;
+  if (newPayer) bucket.newPayers += 1;
+  stats.daily[day] = bucket;
+
+  const days = Object.keys(stats.daily).sort();
+  while (days.length > DAILY_MAX) delete stats.daily[days.shift()];
+
+  statsDirty = true;
+}
+
+// Cumulative series from the first day with activity through today, with gaps
+// filled so a quiet week reads as flat rather than as missing data.
+function buildSeries() {
+  const days = Object.keys(stats.daily).sort();
+  if (!days.length) return [];
+
+  const start = new Date(days[0] + 'T00:00:00Z');
+  const end = new Date(today() + 'T00:00:00Z');
+  const out = [];
+  let calls = 0;
+  let payers = 0;
+
+  for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+    const key = d.toISOString().slice(0, 10);
+    const b = stats.daily[key];
+    if (b) { calls += b.calls; payers += b.newPayers; }
+    out.push({ date: key, calls, payers });
+  }
+  return out;
+}
+
+function recordAudit({ held, changePct }) {
+  stats.calibration.resolved += 1;
+  if (held) stats.calibration.contained += 1;
+  stats.calibration.absErrors.push(Math.abs(Number(changePct) || 0));
+  if (stats.calibration.absErrors.length > ERRORS_MAX) stats.calibration.absErrors.shift();
+  stats.calibration.recent.push({ held: Boolean(held), changePct: Number(changePct) || 0 });
+  if (stats.calibration.recent.length > RECENT_MAX) stats.calibration.recent.shift();
+  statsDirty = true;
+}
+
+function medianOf(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+await loadStats();
+setInterval(flushStats, 15000).unref();
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => { await flushStats(); process.exit(0); });
+}
+
+// ---------------------------------------------------------------------------
 // SSRF guard for caller-supplied URLs. Resolve first, refuse anything that
 // isn't public unicast. Residual TOCTOU gap: Node re-resolves DNS on fetch,
 // so a hostile resolver could answer differently the second time. Closing
@@ -717,389 +864,440 @@ app.get('/', (req, res) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Lotus Network API — metered services on Base</title>
+      <title>Lotus Network — metered services on Base</title>
+      <meta name="description" content="Five pay-per-call services on Base, settled in USDC over x402. No key, no account, no subscription.">
       <link rel="preconnect" href="https://fonts.googleapis.com">
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-      <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+      <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
       <style>
-        :root {
-          --ink:    #0B1420;
-          --panel:  #12202E;
-          --rule:   #1E3346;
-          --bone:   #E8E2D4;
-          --dim:    #7A8FA3;
-          --amber:  #E8A33D;
-          --teal:   #6FC3B8;
-          --red:    #E2685C;
-          --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-          --display: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
+        :root{
+          --ink:#08111C; --panel:#0E1A27; --rule:#1C3145;
+          --bone:#EAE5D9; --dim:#7F94A8; --faint:#4A6076;
+          --amber:#E8A33D; --teal:#6FC3B8; --red:#E2685C;
+          --mono:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+          --sans:'Space Grotesk',-apple-system,BlinkMacSystemFont,sans-serif;
         }
+        *{box-sizing:border-box}
+        html{scroll-behavior:smooth}
+        body{margin:0;background:var(--ink);color:var(--bone);font-family:var(--sans);
+          font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}
 
-        * { box-sizing: border-box; }
+        .pulse{border-bottom:1px solid var(--rule);background:var(--panel);
+          position:sticky;top:0;z-index:20}
+        .pulse-in{max-width:1120px;margin:0 auto;padding:0 32px;display:flex;
+          overflow-x:auto;scrollbar-width:none}
+        .pulse-in::-webkit-scrollbar{display:none}
+        .tk{display:flex;align-items:baseline;gap:9px;padding:11px 20px;
+          border-right:1px solid var(--rule);white-space:nowrap;font-family:var(--mono)}
+        .tk:first-child{padding-left:0} .tk:last-child{border-right:none}
+        .tk .l{color:var(--faint);font-size:10px;letter-spacing:.16em;text-transform:uppercase}
+        .tk .v{color:var(--bone);font-size:12.5px;font-weight:500;font-variant-numeric:tabular-nums}
+        .tk .v.a{color:var(--amber)} .tk .v.t{color:var(--teal)}
+        .tk .u{color:var(--faint);font-size:10px;margin-left:2px}
+        .dot{width:5px;height:5px;border-radius:50%;background:var(--teal);display:inline-block;
+          box-shadow:0 0 7px var(--teal);animation:br 2.8s ease-in-out infinite;flex:none}
+        @keyframes br{0%,100%{opacity:1}50%{opacity:.3}}
 
-        body {
-          margin: 0;
-          background: var(--ink);
-          color: var(--bone);
-          font-family: var(--mono);
-          font-size: 14px;
-          line-height: 1.5;
-          -webkit-font-smoothing: antialiased;
-          background-image:
-            repeating-linear-gradient(0deg, rgba(255,255,255,0.012) 0 1px, transparent 1px 3px);
-        }
+        .wrap{max-width:1120px;margin:0 auto;padding:0 32px}
+        .cols{display:grid;grid-template-columns:236px 1fr;gap:72px;align-items:start}
+        .rail{position:sticky;top:80px;padding:56px 0 0}
+        .main{padding:56px 0 40px;min-width:0}
 
-        .shell { max-width: 660px; margin: 0 auto; padding: 0 20px 72px; }
+        .brand{font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;
+          color:var(--bone);font-weight:600;margin-bottom:6px}
+        .brand-sub{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;
+          color:var(--faint);text-transform:uppercase;margin-bottom:30px}
+        .rs{padding:13px 0;border-top:1px solid var(--rule)}
+        .rs .l{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;
+          color:var(--faint);margin-bottom:4px}
+        .rs .v{font-family:var(--mono);font-size:17px;font-variant-numeric:tabular-nums;
+          color:var(--bone);font-weight:500}
+        .rs .v.t{color:var(--teal)} .rs .v small{font-size:11px;color:var(--faint)}
+        .rail-nav{margin-top:30px;border-top:1px solid var(--rule);padding-top:18px;
+          display:flex;flex-direction:column;gap:9px}
+        .rail-nav a{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;
+          color:var(--dim);text-decoration:none;transition:color .15s}
+        .rail-nav a:hover{color:var(--amber)}
 
-        /* ---- instrument header ---- */
-        .bar {
-          display: flex; align-items: center; gap: 12px;
-          padding: 14px 0; border-bottom: 1px solid var(--rule);
-          font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
-          color: var(--dim);
-        }
-        .bar .mark { color: var(--bone); letter-spacing: 0.2em; font-weight: 600; }
-        .bar .spacer { flex: 1; }
-        .lamp {
-          width: 6px; height: 6px; border-radius: 50%;
-          background: var(--rule); display: inline-block; margin-right: 6px;
-          vertical-align: 1px;
-        }
-        .lamp.on { background: var(--teal); box-shadow: 0 0 8px var(--teal); }
+        .eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.24em;
+          text-transform:uppercase;color:var(--amber);margin-bottom:22px}
+        h1{font-size:clamp(38px,5.2vw,60px);line-height:1.02;letter-spacing:-.033em;
+          font-weight:700;margin:0 0 24px;max-width:14ch}
+        h1 em{font-style:normal;color:var(--amber)}
+        .lede{font-size:17px;color:var(--dim);max-width:52ch;margin:0 0 34px;line-height:1.62}
+        .lede b{color:var(--bone);font-weight:500}
+        .cta{display:flex;gap:12px;flex-wrap:wrap}
+        .btn{font-family:var(--mono);font-size:12px;letter-spacing:.13em;text-transform:uppercase;
+          padding:13px 22px;text-decoration:none;font-weight:500;transition:.15s;
+          border:1px solid;cursor:pointer;display:inline-block}
+        .btn.p{background:var(--amber);color:var(--ink);border-color:var(--amber);font-weight:600}
+        .btn.p:hover{filter:brightness(1.1)}
+        .btn.s{background:transparent;color:var(--bone);border-color:var(--rule)}
+        .btn.s:hover{border-color:var(--amber);color:var(--amber)}
 
-        /* ---- hero ---- */
-        .hero { padding: 56px 0 40px; border-bottom: 1px solid var(--rule); }
-        .eyebrow {
-          font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
-          color: var(--amber); margin-bottom: 18px;
-        }
-        h1 {
-          font-family: var(--display);
-          font-weight: 700; font-size: 40px; line-height: 1.05;
-          letter-spacing: -0.02em; margin: 0 0 16px;
-        }
-        h1 em { font-style: normal; color: var(--amber); }
-        .lede { color: var(--dim); max-width: 46ch; margin: 0; }
-        .lede a { color: var(--bone); text-decoration: none; border-bottom: 1px solid var(--rule); }
-        .lede a:hover { border-color: var(--amber); }
+        section{padding:60px 0;border-top:1px solid var(--rule);margin-top:60px}
+        .sl{display:flex;align-items:baseline;gap:14px;margin-bottom:12px;flex-wrap:wrap}
+        .sl .n{font-family:var(--mono);font-size:11px;color:var(--faint);letter-spacing:.1em}
+        .sl h2{font-size:25px;font-weight:700;letter-spacing:-.018em;margin:0}
+        .sl .r{margin-left:auto;font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;
+          text-transform:uppercase;color:var(--faint)}
+        .sd{color:var(--dim);font-size:14.5px;max-width:60ch;margin:0 0 30px}
 
-        /* ---- section scaffolding ---- */
-        .sec { padding: 32px 0; border-bottom: 1px solid var(--rule); }
-        .sec-label {
-          font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
-          color: var(--dim); margin-bottom: 16px; display: flex; gap: 10px; align-items: baseline;
-        }
-        .sec-label .idx { color: var(--rule); }
+        .rate{border:1px solid var(--rule)}
+        .row{display:grid;grid-template-columns:52px 1fr auto;gap:18px;align-items:baseline;
+          padding:17px 20px;border-bottom:1px solid var(--rule);transition:background .14s;
+          cursor:pointer;position:relative}
+        .row:last-child{border-bottom:none}
+        .row:hover{background:var(--panel)}
+        .row.on{background:var(--panel);box-shadow:inset 2px 0 0 var(--amber)}
+        .meth{font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;color:var(--faint);
+          border:1px solid var(--rule);padding:2px 0;text-align:center}
+        .row.on .meth{color:var(--amber);border-color:var(--amber)}
+        .row .nm{font-weight:500;font-size:15.5px}
+        .row .pr{font-family:var(--mono);font-size:14px;color:var(--amber);
+          font-variant-numeric:tabular-nums;font-weight:500}
+        .row .ds{grid-column:2/-1;font-size:13.5px;color:var(--dim);margin-top:4px;line-height:1.55}
+        .row .pt{grid-column:2/-1;font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:7px}
 
-        /* ---- rate card ---- */
-        .rate { display: block; }
-        .rate input { position: absolute; opacity: 0; pointer-events: none; }
-        .rate label {
-          display: grid; grid-template-columns: 14px 1fr auto;
-          gap: 14px; align-items: baseline;
-          padding: 13px 14px; border: 1px solid var(--rule); margin-bottom: -1px;
-          cursor: pointer; transition: background 0.12s, border-color 0.12s;
-        }
-        .rate label:hover { background: #16283A; }
-        .rate .tick { color: var(--rule); }
-        .rate .name { color: var(--dim); }
-        .rate .price { color: var(--dim); font-variant-numeric: tabular-nums; }
-        .rate input:checked + label { border-color: var(--amber); background: #16283A; position: relative; z-index: 1; }
-        .rate input:checked + label .tick { color: var(--amber); }
-        .rate input:checked + label .name { color: var(--bone); }
-        .rate input:checked + label .price { color: var(--amber); }
-        .rate input:focus-visible + label { outline: 2px solid var(--teal); outline-offset: 2px; }
-        .rate .sub { grid-column: 2 / -1; font-size: 12px; color: var(--dim); opacity: 0.75; margin-top: 3px; }
+        .code{border:1px solid var(--rule);background:var(--panel);margin-top:18px}
+        .code-h{display:flex;align-items:center;padding:10px 16px;border-bottom:1px solid var(--rule);
+          font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;
+          color:var(--faint)}
+        .code-h button{margin-left:auto;background:transparent;border:1px solid var(--rule);
+          color:var(--dim);font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+          text-transform:uppercase;padding:5px 11px;cursor:pointer;transition:.14s}
+        .code-h button:hover{border-color:var(--amber);color:var(--amber)}
+        pre{margin:0;padding:17px 16px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;
+          line-height:1.75;color:var(--dim)}
+        pre .c{color:var(--faint)} pre .k{color:var(--amber)} pre .s{color:var(--teal)}
+        pre .w{color:var(--bone)}
 
-        /* ---- fields ---- */
-        .field { margin-bottom: 18px; }
-        .field:last-child { margin-bottom: 0; }
-        label.cap {
-          display: block; font-size: 11px; letter-spacing: 0.16em;
-          text-transform: uppercase; color: var(--dim); margin-bottom: 7px;
-        }
-        input[type=text], input[type=number], select {
-          width: 100%; padding: 12px 13px;
-          background: var(--ink); color: var(--bone);
-          border: 1px solid var(--rule); border-radius: 0;
-          font-family: var(--mono); font-size: 14px;
-        }
-        input[type=text]:focus, input[type=number]:focus, select:focus {
-          outline: none; border-color: var(--amber);
-        }
-        input[type=file] { color: var(--dim); font-family: var(--mono); font-size: 12px; width: 100%; }
-        input[type=file]::file-selector-button {
-          background: transparent; color: var(--bone); border: 1px solid var(--rule);
-          padding: 8px 12px; margin-right: 12px; font-family: var(--mono); font-size: 12px;
-          cursor: pointer;
-        }
-        .note { font-size: 12px; color: var(--dim); opacity: 0.7; margin-top: 7px; }
+        .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--rule);
+          border:1px solid var(--rule);margin-bottom:8px}
+        .step{background:var(--ink);padding:22px 20px}
+        .step .i{font-family:var(--mono);font-size:10.5px;color:var(--amber);
+          letter-spacing:.14em;margin-bottom:11px}
+        .step h3{font-size:15.5px;margin:0 0 7px;font-weight:500}
+        .step p{font-size:13px;color:var(--dim);margin:0;line-height:1.6}
 
-        /* ---- run ---- */
-        .run {
-          width: 100%; display: flex; justify-content: space-between; align-items: center;
-          padding: 15px 16px; margin-top: 4px;
-          background: var(--amber); color: var(--ink);
-          border: none; border-radius: 0; cursor: pointer;
-          font-family: var(--mono); font-weight: 600; font-size: 13px;
-          letter-spacing: 0.14em; text-transform: uppercase;
-          transition: filter 0.12s;
-        }
-        .run:hover:not(:disabled) { filter: brightness(1.12); }
-        .run:disabled { background: var(--rule); color: var(--dim); cursor: wait; }
-        .run .amt { font-variant-numeric: tabular-nums; letter-spacing: 0.04em; }
+        .cal{display:grid;grid-template-columns:auto 1fr;gap:36px;align-items:center;margin-bottom:30px}
+        .big{font-size:78px;line-height:.9;color:var(--teal);font-weight:700;
+          letter-spacing:-.045em;font-variant-numeric:tabular-nums}
+        .big span{font-size:30px;color:var(--faint);margin-left:2px}
+        .cal p{margin:0;font-size:14.5px;color:var(--dim);max-width:46ch;line-height:1.65}
+        .cal p b{color:var(--bone);font-weight:500}
+        .strip{display:flex;gap:3px;height:46px;align-items:flex-end;margin-bottom:12px}
+        .m{flex:1;border-radius:1px}
+        .m.h{background:rgba(111,195,184,.26);border-top:2px solid var(--teal);height:100%}
+        .m.x{background:rgba(226,104,92,.2);border-top:2px solid var(--red);height:58%}
+        .key{display:flex;gap:22px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+          text-transform:uppercase;color:var(--faint)}
+        .key i{width:9px;height:2px;display:inline-block;margin-right:6px;vertical-align:3px}
+        .key .h i{background:var(--teal)} .key .x i{background:var(--red)}
+        .g4{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--rule);
+          border:1px solid var(--rule);margin-top:30px}
+        .c4{background:var(--ink);padding:18px}
+        .c4 .l{font-family:var(--mono);font-size:9.5px;letter-spacing:.15em;text-transform:uppercase;
+          color:var(--faint);margin-bottom:7px}
+        .c4 .v{font-family:var(--mono);font-size:23px;font-variant-numeric:tabular-nums;font-weight:500}
+        .c4 .v small{font-size:12px;color:var(--faint);margin-left:2px}
+        .vf{margin-top:20px;font-size:13px;color:var(--dim);line-height:1.7}
+        .vf a{color:var(--teal);text-decoration:none;border-bottom:1px solid rgba(111,195,184,.3)}
 
-        /* ---- SIGNATURE 1: handshake ladder ---- */
-        .ladder { margin-top: 22px; display: none; }
-        .ladder.show { display: block; }
-        .rung {
-          display: grid; grid-template-columns: 22px 1fr auto; gap: 12px;
-          align-items: center; padding: 7px 0; font-size: 12px;
-          color: var(--rule); transition: color 0.2s;
-        }
-        .rung .n { font-variant-numeric: tabular-nums; }
-        .rung .track { height: 1px; background: var(--rule); transition: background 0.2s; }
-        .rung .st { font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; }
-        .rung.active { color: var(--amber); }
-        .rung.active .track { background: var(--amber); }
-        .rung.done { color: var(--teal); }
-        .rung.done .track { background: var(--teal); }
-        .rung.failed { color: var(--red); }
-        .rung.failed .track { background: var(--red); }
+        .chart-wrap{border:1px solid var(--rule);background:var(--panel);padding:22px}
+        .chart-h{display:flex;justify-content:space-between;align-items:baseline;
+          font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;
+          color:var(--faint);margin-bottom:18px;gap:14px;flex-wrap:wrap}
+        .chart-legend{display:flex;gap:16px}
+        .chart-legend span i{width:9px;height:2px;display:inline-block;margin-right:6px;vertical-align:3px}
+        .lg-p i{background:var(--teal)} .lg-c i{background:var(--amber)}
+        svg.chart{width:100%;height:180px;display:block;overflow:visible}
+        .chart-empty{color:var(--dim);font-size:13.5px;line-height:1.7;padding:26px 0}
 
-        /* ---- output ---- */
-        .out { display: none; padding-top: 32px; }
-        .out.show { display: block; }
-        .out img { width: 100%; display: block; border: 1px solid var(--rule); }
-        pre.data {
-          margin: 0; padding: 16px; background: #0D1926; border: 1px solid var(--rule);
-          font-family: var(--mono); font-size: 11.5px; line-height: 1.65; color: var(--dim);
-          max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word;
-        }
-        pre.data .k { color: var(--bone); }
+        .band-wrap{border:1px solid var(--rule);padding:24px;margin-top:20px;background:var(--panel)}
+        .band-h{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10.5px;
+          letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-bottom:24px;gap:12px}
+        .band-h .vd.held{color:var(--teal)} .band-h .vd.missed{color:var(--red)}
+        .band{position:relative;height:70px}
+        .ax{position:absolute;top:34px;left:0;right:0;height:1px;background:var(--rule)}
+        .rg{position:absolute;top:25px;height:19px;background:rgba(232,163,61,.14);
+          border-left:1px solid var(--amber);border-right:1px solid var(--amber)}
+        .nd{position:absolute;top:18px;width:1px;height:33px;background:var(--amber)}
+        .nd::after{content:'';position:absolute;top:-4px;left:-3.5px;width:8px;height:8px;
+          background:var(--amber);transform:rotate(45deg)}
+        .ac{position:absolute;top:18px;width:1px;height:33px;background:var(--teal)}
+        .ac::after{content:'';position:absolute;top:-4px;left:-3.5px;width:8px;height:8px;
+          border-radius:50%;background:var(--teal)}
+        .ac.missed{background:var(--red)} .ac.missed::after{background:var(--red)}
+        .tg{position:absolute;font-family:var(--mono);font-size:10px;color:var(--faint);
+          white-space:nowrap;transform:translateX(-50%)}
+        .tg.up{top:2px} .tg.dn{top:54px}
+        .tg.a{color:var(--amber)} .tg.t{color:var(--teal)} .tg.r{color:var(--red)}
 
-        /* ---- SIGNATURE 2: the fee band meter ---- */
-        .meter { margin-bottom: 22px; }
-        .meter-head {
-          display: flex; justify-content: space-between; align-items: baseline;
-          font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
-          color: var(--dim); margin-bottom: 14px;
-        }
-        .meter-head .verdict.held { color: var(--teal); }
-        .meter-head .verdict.missed { color: var(--red); }
-        .band { position: relative; height: 62px; }
-        .band .axis { position: absolute; top: 30px; left: 0; right: 0; height: 1px; background: var(--rule); }
-        .band .range {
-          position: absolute; top: 22px; height: 17px;
-          background: rgba(232,163,61,0.16); border-left: 1px solid var(--amber); border-right: 1px solid var(--amber);
-        }
-        .band .needle { position: absolute; top: 16px; width: 1px; height: 29px; background: var(--amber); }
-        .band .needle::after {
-          content: ''; position: absolute; top: -4px; left: -3px;
-          width: 7px; height: 7px; background: var(--amber); transform: rotate(45deg);
-        }
-        .band .actual { position: absolute; top: 16px; width: 1px; height: 29px; background: var(--teal); }
-        .band .actual::after {
-          content: ''; position: absolute; top: -4px; left: -3px;
-          width: 7px; height: 7px; border-radius: 50%; background: var(--teal);
-        }
-        .band .actual.missed { background: var(--red); }
-        .band .actual.missed::after { background: var(--red); }
-        .band .tag {
-          position: absolute; top: 46px; font-size: 10px; letter-spacing: 0.08em;
-          color: var(--dim); white-space: nowrap; transform: translateX(-50%);
-        }
-        .band .tag.hi { top: 0; }
-        .band .tag.amber { color: var(--amber); }
-        .band .tag.teal { color: var(--teal); }
-        .band .tag.red { color: var(--red); }
+        label.cap{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+          text-transform:uppercase;color:var(--faint);margin-bottom:8px}
+        input[type=text],input[type=number],select{width:100%;padding:13px 14px;background:var(--ink);
+          color:var(--bone);border:1px solid var(--rule);border-radius:0;font-family:var(--mono);
+          font-size:14px}
+        input:focus,select:focus{outline:none;border-color:var(--amber)}
+        input[type=file]{color:var(--dim);font-family:var(--mono);font-size:12px;width:100%}
+        input[type=file]::file-selector-button{background:transparent;color:var(--bone);
+          border:1px solid var(--rule);padding:9px 13px;margin-right:12px;font-family:var(--mono);
+          font-size:11px;cursor:pointer}
+        .field{margin-bottom:18px}
+        .hint{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:8px}
+        .run{width:100%;display:flex;justify-content:space-between;align-items:center;
+          padding:16px 18px;background:var(--amber);color:var(--ink);border:none;cursor:pointer;
+          font-family:var(--mono);font-weight:600;font-size:12.5px;letter-spacing:.14em;
+          text-transform:uppercase;transition:filter .14s}
+        .run:hover:not(:disabled){filter:brightness(1.1)}
+        .run:disabled{background:var(--rule);color:var(--faint);cursor:wait}
+        .ladder{margin-top:22px;display:none}
+        .ladder.show{display:block}
+        .rung{display:grid;grid-template-columns:22px 1fr auto;gap:12px;align-items:center;
+          padding:7px 0;font-family:var(--mono);font-size:11.5px;color:var(--rule);transition:color .2s}
+        .rung .tr{height:1px;background:var(--rule);transition:background .2s}
+        .rung .st{font-size:10px;letter-spacing:.16em;text-transform:uppercase}
+        .rung.active{color:var(--amber)} .rung.active .tr{background:var(--amber)}
+        .rung.done{color:var(--teal)} .rung.done .tr{background:var(--teal)}
+        .rung.failed{color:var(--red)} .rung.failed .tr{background:var(--red)}
+        .fail{margin-top:18px;padding:14px 16px;border-left:2px solid var(--red);
+          background:rgba(226,104,92,.06);font-size:13px;white-space:pre-wrap;
+          word-break:break-word;display:none;font-family:var(--mono);line-height:1.6}
+        .fail.show{display:block}
+        .out{display:none;margin-top:26px}
+        .out.show{display:block}
+        .out img{width:100%;display:block;border:1px solid var(--rule)}
+        pre.data{margin:0;padding:17px;background:var(--panel);border:1px solid var(--rule);
+          font-size:12px;line-height:1.7;color:var(--dim);max-height:340px;overflow:auto;
+          white-space:pre-wrap;word-break:break-word}
+        .acts{display:flex;gap:1px;margin-top:1px}
+        .acts button{flex:1;padding:13px 8px;background:var(--panel);color:var(--bone);
+          border:1px solid var(--rule);cursor:pointer;font-family:var(--mono);font-size:10.5px;
+          letter-spacing:.13em;text-transform:uppercase}
+        .acts button:hover{border-color:var(--amber);color:var(--amber)}
+        .meta{margin-top:16px;font-family:var(--mono);font-size:11.5px;color:var(--faint);
+          line-height:1.75;word-break:break-all}
+        .meta a{color:var(--teal);text-decoration:none}
+        .toast{margin-top:10px;font-family:var(--mono);font-size:11.5px;color:var(--teal);min-height:1.2em}
+        .toast.bad{color:var(--red)}
+        .empty{color:var(--dim);font-size:13.5px;line-height:1.7}
 
-        /* ---- actions + meta ---- */
-        .acts { display: flex; gap: 1px; margin-top: 1px; }
-        .acts button {
-          flex: 1; padding: 12px 8px; background: var(--panel); color: var(--bone);
-          border: 1px solid var(--rule); border-radius: 0; cursor: pointer;
-          font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
-          text-transform: uppercase;
-        }
-        .acts button:hover { border-color: var(--amber); color: var(--amber); }
-        .meta { margin-top: 16px; font-size: 12px; color: var(--dim); line-height: 1.75; word-break: break-all; }
-        .meta a { color: var(--teal); text-decoration: none; }
-        .meta a:hover { text-decoration: underline; }
-        .toast { margin-top: 10px; font-size: 12px; color: var(--teal); min-height: 1.2em; }
-        .toast.bad { color: var(--red); }
-        .fail {
-          margin-top: 18px; padding: 13px 14px; border-left: 2px solid var(--red);
-          background: rgba(226,104,92,0.07); color: var(--bone);
-          font-size: 12.5px; white-space: pre-wrap; word-break: break-word; display: none;
-        }
-        .fail.show { display: block; }
+        footer{border-top:1px solid var(--rule);padding:34px 0 60px;display:flex;gap:28px;
+          flex-wrap:wrap;font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+          text-transform:uppercase;color:var(--faint)}
+        footer a{color:var(--faint);text-decoration:none}
+        footer a:hover{color:var(--amber)}
+        .hidden{display:none!important}
 
-        /* ---- footer ---- */
-        footer {
-          padding: 28px 0; font-size: 11px; letter-spacing: 0.1em;
-          text-transform: uppercase; color: var(--dim);
-          display: flex; flex-wrap: wrap; gap: 20px;
+        @media(max-width:960px){
+          .cols{grid-template-columns:1fr;gap:0}
+          .rail{position:static;padding:34px 0 0;display:grid;grid-template-columns:repeat(2,1fr);gap:0 28px}
+          .rail .brand,.rail .brand-sub,.rail-nav{grid-column:1/-1}
+          .main{padding-top:38px}
+          .steps{grid-template-columns:1fr}
+          .g4{grid-template-columns:repeat(2,1fr)}
+          .cal{grid-template-columns:1fr;gap:18px}
+          .wrap{padding:0 22px}
         }
-        footer a { color: var(--dim); text-decoration: none; border-bottom: 1px solid transparent; }
-        footer a:hover { color: var(--amber); border-color: var(--amber); }
-
-        .hidden { display: none !important; }
-
-        @media (max-width: 560px) {
-          h1 { font-size: 30px; }
-          .hero { padding: 40px 0 32px; }
-        }
-        @media (prefers-reduced-motion: reduce) {
-          * { transition: none !important; }
-        }
+        @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
       </style>
     </head>
     <body>
-      <div class="shell">
 
-        <div class="bar">
-          <span class="mark">Lotus Network</span>
-          <span class="spacer"></span>
-          <span id="statusLamp"><span class="lamp"></span><span id="statusText">checking</span></span>
+    <div class="pulse"><div class="pulse-in">
+      <div class="tk"><span class="dot"></span><span class="l">Base gas</span><span class="v a" id="t_gas">—</span></div>
+      <div class="tk"><span class="l">Block</span><span class="v" id="t_block">—</span></div>
+      <div class="tk"><span class="l">Congestion</span><span class="v t" id="t_cong">—</span></div>
+      <div class="tk"><span class="l">Calls served</span><span class="v" id="t_calls">—</span></div>
+      <div class="tk"><span class="l">Paying wallets</span><span class="v" id="t_payers">—</span></div>
+      <div class="tk hidden" id="t_eco_wrap"><span class="l">x402 endpoints</span><span class="v" id="t_eco">—</span></div>
+    </div></div>
+
+    <div class="wrap"><div class="cols">
+
+      <aside class="rail">
+        <div class="brand">Lotus Network</div>
+        <div class="brand-sub">Base mainnet · x402 v2</div>
+        <div class="rs"><div class="l">Services</div><div class="v" id="r_svc">5</div></div>
+        <div class="rs"><div class="l">Calls served</div><div class="v" id="r_calls">—</div></div>
+        <div class="rs"><div class="l">Interval held</div><div class="v t" id="r_hit">—</div></div>
+        <div class="rs"><div class="l">From</div><div class="v">$${PRICE_PREFLIGHT}</div></div>
+        <nav class="rail-nav">
+          <a href="#services">Services</a>
+          <a href="#start">Quick start</a>
+          <a href="#record">Calibration record</a>
+          <a href="#adoption">Adoption</a>
+          <a href="#try">Try it</a>
+          <a href="/openapi.json">OpenAPI ↗</a>
+          <a href="/llms.txt">llms.txt ↗</a>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <div class="eyebrow">Metered access · no accounts</div>
+        <h1>Five services.<br>Priced <em>per call</em>.</h1>
+        <p class="lede">Settled in USDC on Base over the x402 protocol. <b>No key, no account,
+          no subscription</b> — a wallet is asked once per request, and the receipt is on-chain.
+          Built for agents; usable by anyone with a browser wallet.</p>
+        <div class="cta">
+          <a href="#start" class="btn p">Quick start</a>
+          <a href="#record" class="btn s">See the record</a>
         </div>
 
-        <div class="hero">
-          <div class="eyebrow">Metered access · Base mainnet</div>
-          <h1>Five services.<br>Priced <em>per call</em>.</h1>
-          <p class="lede">
-            Settled in USDC over <a href="/openapi.json">x402</a>. No key, no account, no
-            subscription — your wallet is asked once per request, and the receipt is on-chain.
-          </p>
-        </div>
-
-        <div class="sec">
-          <div class="sec-label"><span class="idx">01</span><span>Rate card</span></div>
+        <section id="services">
+          <div class="sl"><span class="n">01</span><h2>Services</h2><span class="r">USDC · eip155:8453</span></div>
+          <p class="sd">Every endpoint answers HTTP 402 with its terms. Pay, retry, get the result.
+            Selecting a row here also selects it in the panel below.</p>
           <div class="rate" id="rateCard">
-            <input type="radio" name="svc" id="r_image" value="image" checked onchange="switchMode()">
-            <label for="r_image">
-              <span class="tick">▸</span>
-              <span class="name">Image generation</span>
-              <span class="price">$${PRICE_IMAGE}</span>
-              <span class="sub">FLUX text-to-image. Returns bytes plus a durable URL.</span>
-            </label>
-
-            <input type="radio" name="svc" id="r_pdf" value="pdf" onchange="switchMode()">
-            <label for="r_pdf">
-              <span class="tick">▸</span>
-              <span class="name">PDF to Markdown</span>
-              <span class="price">$${PRICE_PDF}</span>
-              <span class="sub">Text layer extraction, unwrapped into clean Markdown.</span>
-            </label>
-
-            <input type="radio" name="svc" id="r_preflight" value="preflight" onchange="switchMode()">
-            <label for="r_preflight">
-              <span class="tick">▸</span>
-              <span class="name">Gas preflight</span>
-              <span class="price">$${PRICE_PREFLIGHT}</span>
-              <span class="sub">Base fee now, plus an 80% range for your horizon.</span>
-            </label>
-
-            <input type="radio" name="svc" id="r_decision" value="decision" onchange="switchMode()">
-            <label for="r_decision">
-              <span class="tick">▸</span>
-              <span class="name">Gas decision</span>
-              <span class="price">$${PRICE_DECISION}</span>
-              <span class="sub">Journals your call against the snapshot. Returns an ID.</span>
-            </label>
-
-            <input type="radio" name="svc" id="r_audit" value="audit" onchange="switchMode()">
-            <label for="r_audit">
-              <span class="tick">▸</span>
-              <span class="name">Gas audit</span>
-              <span class="price">$${PRICE_AUDIT}</span>
-              <span class="sub">Checks that ID against what the chain actually did.</span>
-            </label>
+            <div class="row on" data-mode="image">
+              <span class="meth">GET</span><span class="nm">Image generation</span><span class="pr">$${PRICE_IMAGE}</span>
+              <span class="ds">FLUX text-to-image. Returns the bytes plus a durable URL.</span>
+              <span class="pt">/api/v1/generate-image</span>
+            </div>
+            <div class="row" data-mode="pdf">
+              <span class="meth">POST</span><span class="nm">PDF to Markdown</span><span class="pr">$${PRICE_PDF}</span>
+              <span class="ds">Text-layer extraction, unwrapped into clean Markdown with headings and lists.</span>
+              <span class="pt">/api/v1/pdf-to-markdown</span>
+            </div>
+            <div class="row" data-mode="preflight">
+              <span class="meth">GET</span><span class="nm">Gas preflight</span><span class="pr">$${PRICE_PREFLIGHT}</span>
+              <span class="ds">Current Base fee, recent percentiles, realised volatility, and an 80% forecast range.</span>
+              <span class="pt">/api/v1/gas/preflight</span>
+            </div>
+            <div class="row" data-mode="decision">
+              <span class="meth">POST</span><span class="nm">Gas decision</span><span class="pr">$${PRICE_DECISION}</span>
+              <span class="ds">Journals an execute-or-wait call against the snapshot. Returns a decision_id.</span>
+              <span class="pt">/api/v1/gas/decision</span>
+            </div>
+            <div class="row" data-mode="audit">
+              <span class="meth">GET</span><span class="nm">Gas audit</span><span class="pr">$${PRICE_AUDIT}</span>
+              <span class="ds">Checks that decision_id against what the chain actually did at the target block.</span>
+              <span class="pt">/api/v1/gas/audit/{id}</span>
+            </div>
           </div>
-        </div>
+        </section>
 
-        <div class="sec">
-          <div class="sec-label"><span class="idx">02</span><span>Input</span></div>
+        <section id="start">
+          <div class="sl"><span class="n">02</span><h2>Quick start</h2></div>
+          <p class="sd">Three steps. Nothing to provision — the 402 response carries everything
+            a client needs in order to pay.</p>
+          <div class="steps">
+            <div class="step"><div class="i">01</div><h3>Ask</h3>
+              <p>Call the endpoint with no payment header. You get 402 and the terms in a header.</p></div>
+            <div class="step"><div class="i">02</div><h3>Sign</h3>
+              <p>Sign an EIP-3009 USDC authorization for exactly the amount quoted.</p></div>
+            <div class="step"><div class="i">03</div><h3>Retry</h3>
+              <p>Send it back as PAYMENT-SIGNATURE. Settlement and the result arrive together.</p></div>
+          </div>
+
+          <div class="code">
+            <div class="code-h"><span>Read the terms — free</span><button onclick="copyCode(this)">Copy</button></div>
+<pre data-raw="curl -i ${BASE_URL}/api/v1/gas/preflight"><span class="c"># An unpaid request returns the price, the asset and the network</span>
+<span class="k">curl</span> -i <span class="s">${BASE_URL}/api/v1/gas/preflight</span>
+
+<span class="c"># HTTP/2 402</span>
+<span class="c"># payment-required: eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0cyI6W3si...</span></pre>
+          </div>
+
+          <div class="code">
+            <div class="code-h"><span>Or let a client handle the handshake</span><button onclick="copyCode(this)">Copy</button></div>
+<pre data-raw="import { wrapFetchWithPayment } from '@x402/fetch';
+
+const pay = wrapFetchWithPayment(fetch, wallet);
+const res = await pay('${BASE_URL}/api/v1/gas/preflight');
+const { forecast } = await res.json();"><span class="k">import</span> { wrapFetchWithPayment } <span class="k">from</span> <span class="s">'@x402/fetch'</span>;
+
+<span class="k">const</span> <span class="w">pay</span> = wrapFetchWithPayment(fetch, wallet);
+<span class="k">const</span> <span class="w">res</span> = <span class="k">await</span> pay(<span class="s">'${BASE_URL}/api/v1/gas/preflight'</span>);
+<span class="k">const</span> { forecast } = <span class="k">await</span> res.json();
+<span class="c">// { lowGwei: 0.0106, centerGwei: 0.0139, highGwei: 0.0182 }</span></pre>
+          </div>
+        </section>
+
+        <section id="record">
+          <div class="sl"><span class="n">03</span><h2>Calibration record</h2><span class="r" id="calScope"></span></div>
+          <p class="sd">Anyone can publish a forecast. This is the part that can be checked: every
+            journalled decision is resolved against the base fee at its target block, and the
+            misses are published alongside the hits.</p>
+          <div id="calBody"><div class="empty">Loading the record…</div></div>
+        </section>
+
+        <section id="adoption">
+          <div class="sl"><span class="n">04</span><h2>Adoption</h2><span class="r" id="adScope"></span></div>
+          <p class="sd">Cumulative calls and distinct paying wallets, one point per day since the
+            first payment. These are wallets that settled, not a count of agents — nothing
+            on-chain distinguishes an autonomous agent from a person holding a wallet.</p>
+          <div class="chart-wrap">
+            <div class="chart-h">
+              <span id="adRange">—</span>
+              <span class="chart-legend">
+                <span class="lg-p"><i></i>Paying wallets</span>
+                <span class="lg-c"><i></i>Calls</span>
+              </span>
+            </div>
+            <div id="chartHost"><div class="chart-empty">No payments recorded yet. The series
+              starts on the first settled call and extends a point per day from there.</div></div>
+          </div>
+        </section>
+
+        <section id="try">
+          <div class="sl"><span class="n">05</span><h2>Try it</h2></div>
+          <p class="sd">Runs against the live API from your browser wallet. Real USDC, real
+            settlement — the smallest call costs $${PRICE_PREFLIGHT}.</p>
 
           <div id="f_image">
-            <div class="field">
-              <label class="cap" for="prompt">Prompt</label>
-              <input type="text" id="prompt" placeholder="a harbour crane at dawn, long exposure">
-            </div>
+            <div class="field"><label class="cap" for="prompt">Prompt</label>
+              <input type="text" id="prompt" placeholder="a harbour crane at dawn, long exposure"></div>
           </div>
-
           <div id="f_pdf" class="hidden">
-            <div class="field">
-              <label class="cap" for="pdfUrl">PDF address</label>
-              <input type="text" id="pdfUrl" placeholder="https://example.com/report.pdf">
-            </div>
-            <div class="field">
-              <label class="cap" for="pdfFile">Or send a file</label>
+            <div class="field"><label class="cap" for="pdfUrl">PDF address</label>
+              <input type="text" id="pdfUrl" placeholder="https://example.com/report.pdf"></div>
+            <div class="field"><label class="cap" for="pdfFile">Or send a file</label>
               <input type="file" id="pdfFile" accept="application/pdf">
-              <div class="note">20 MB ceiling. Scanned PDFs carry no text layer and return empty.</div>
-            </div>
+              <div class="hint">20 MB ceiling. Scanned PDFs carry no text layer and return empty.</div></div>
           </div>
-
           <div id="f_preflight" class="hidden">
-            <div class="field">
-              <label class="cap" for="horizon1">Horizon · minutes</label>
-              <input type="number" id="horizon1" value="5" min="1" max="60">
-            </div>
+            <div class="field"><label class="cap" for="horizon1">Horizon · minutes</label>
+              <input type="number" id="horizon1" value="5" min="1" max="60"></div>
           </div>
-
           <div id="f_decision" class="hidden">
-            <div class="field">
-              <label class="cap" for="stance">Stance</label>
+            <div class="field"><label class="cap" for="stance">Stance</label>
               <select id="stance">
                 <option value="wait">wait — hold, expecting cheaper gas</option>
                 <option value="execute">execute — transact now</option>
-              </select>
-            </div>
-            <div class="field">
-              <label class="cap" for="horizon2">Horizon · minutes</label>
+              </select></div>
+            <div class="field"><label class="cap" for="horizon2">Horizon · minutes</label>
               <input type="number" id="horizon2" value="15" min="1" max="60">
-              <div class="note">Keep the ID it returns. The audit needs it once the horizon elapses.</div>
-            </div>
+              <div class="hint">Keep the ID it returns. The audit needs it once the horizon elapses.</div></div>
           </div>
-
           <div id="f_audit" class="hidden">
-            <div class="field">
-              <label class="cap" for="decisionId">Decision ID</label>
+            <div class="field"><label class="cap" for="decisionId">Decision ID</label>
               <input type="text" id="decisionId" placeholder="32 hex characters">
-              <div class="note">Returns pending until the target block is reached.</div>
-            </div>
+              <div class="hint">Returns pending until the target block is reached.</div></div>
           </div>
-        </div>
-
-        <div class="sec">
-          <div class="sec-label"><span class="idx">03</span><span>Settlement</span></div>
 
           <button class="run" id="btn" onclick="run()">
-            <span>Run</span><span class="amt" id="btnAmt">$${PRICE_IMAGE}</span>
-          </button>
+            <span>Run</span><span id="btnAmt">$${PRICE_IMAGE}</span></button>
 
           <div class="ladder" id="ladder">
-            <div class="rung" data-step="1"><span class="n">1</span><span class="track"></span><span class="st">Read terms</span></div>
-            <div class="rung" data-step="2"><span class="n">2</span><span class="track"></span><span class="st">Connect wallet</span></div>
-            <div class="rung" data-step="3"><span class="n">3</span><span class="track"></span><span class="st">Sign authorization</span></div>
-            <div class="rung" data-step="4"><span class="n">4</span><span class="track"></span><span class="st">Settle on Base</span></div>
-            <div class="rung" data-step="5"><span class="n">5</span><span class="track"></span><span class="st">Deliver</span></div>
+            <div class="rung" data-step="1"><span>1</span><span class="tr"></span><span class="st">Read terms</span></div>
+            <div class="rung" data-step="2"><span>2</span><span class="tr"></span><span class="st">Connect wallet</span></div>
+            <div class="rung" data-step="3"><span>3</span><span class="tr"></span><span class="st">Sign authorization</span></div>
+            <div class="rung" data-step="4"><span>4</span><span class="tr"></span><span class="st">Settle on Base</span></div>
+            <div class="rung" data-step="5"><span>5</span><span class="tr"></span><span class="st">Deliver</span></div>
           </div>
 
           <div class="fail" id="fail"></div>
 
           <div class="out" id="out">
-            <div class="meter hidden" id="meter">
-              <div class="meter-head">
-                <span id="meterTitle">Fee band · gwei</span>
-                <span class="verdict" id="meterVerdict"></span>
-              </div>
+            <div class="band-wrap hidden" id="meter">
+              <div class="band-h"><span id="meterTitle">Fee band · gwei</span>
+                <span class="vd" id="meterVerdict"></span></div>
               <div class="band" id="band"></div>
             </div>
-
             <img id="image" alt="" class="hidden">
             <pre class="data hidden" id="data"></pre>
-
             <div class="acts hidden" id="imageActs">
               <button onclick="saveImage()">Save</button>
               <button id="copyImgBtn" onclick="copyImage()">Copy image</button>
@@ -1108,494 +1306,448 @@ app.get('/', (req, res) => {
             <div class="acts hidden" id="textActs">
               <button onclick="copyText()">Copy output</button>
             </div>
-
             <div class="toast" id="toast"></div>
             <div class="meta" id="meta"></div>
           </div>
-        </div>
+        </section>
 
         <footer>
           <a href="/openapi.json">OpenAPI</a>
           <a href="/llms.txt">llms.txt</a>
+          <a href="/api/v1/pulse">Pulse</a>
           <a href="/healthz">Status</a>
-          <span>USDC · eip155:8453</span>
+          <span>USDC · Base · eip155:8453</span>
         </footer>
-      </div>
+      </main>
 
-      <script>
-        const PRICE = {
-          image: '${PRICE_IMAGE}', pdf: '${PRICE_PDF}', preflight: '${PRICE_PREFLIGHT}',
-          decision: '${PRICE_DECISION}', audit: '${PRICE_AUDIT}'
-        };
-        const MODES = ['image', 'pdf', 'preflight', 'decision', 'audit'];
+    </div></div>
 
-        let mode = 'image';
-        let lastResult = null;
-        let lastText = '';
-        let pngPromise = null;
-        let pngBlob = null;
-        let clipboardBlocked = false;
+    <script>
+      const PRICE={image:'${PRICE_IMAGE}',pdf:'${PRICE_PDF}',preflight:'${PRICE_PREFLIGHT}',
+        decision:'${PRICE_DECISION}',audit:'${PRICE_AUDIT}'};
+      const MODES=['image','pdf','preflight','decision','audit'];
+      let mode='image',lastResult=null,lastText='',pngPromise=null,pngBlob=null,clipboardBlocked=false;
+      const $=id=>document.getElementById(id);
 
-        const $ = id => document.getElementById(id);
-
-        // ---- status lamp ----
-        fetch('/healthz').then(r => r.json()).then(h => {
-          $('statusLamp').innerHTML = '<span class="lamp on"></span>' +
-            (h.endpoints ? h.endpoints.length : 0) + ' services live';
-        }).catch(() => {
-          $('statusText').textContent = 'status unavailable';
+      document.querySelectorAll('#rateCard .row').forEach(row=>{
+        row.addEventListener('click',()=>{
+          document.querySelectorAll('#rateCard .row').forEach(r=>r.classList.remove('on'));
+          row.classList.add('on');
+          mode=row.dataset.mode;
+          MODES.forEach(m=>$('f_'+m).classList.toggle('hidden',m!==mode));
+          $('btnAmt').textContent='$'+PRICE[mode];
+          $('out').classList.remove('show');$('fail').classList.remove('show');
+          $('ladder').classList.remove('show');
         });
+      });
 
-        function switchMode() {
-          const picked = document.querySelector('input[name=svc]:checked');
-          mode = picked ? picked.value : 'image';
-          MODES.forEach(m => $('f_' + m).classList.toggle('hidden', m !== mode));
-          $('btnAmt').textContent = '$' + PRICE[mode];
-          $('out').classList.remove('show');
-          $('fail').classList.remove('show');
-          $('ladder').classList.remove('show');
-        }
+      function copyCode(btn){
+        const raw=btn.closest('.code').querySelector('pre').dataset.raw||'';
+        navigator.clipboard.writeText(raw).then(()=>{
+          btn.textContent='Copied';setTimeout(()=>btn.textContent='Copy',1800);
+        }).catch(()=>{btn.textContent='Blocked';setTimeout(()=>btn.textContent='Copy',1800);});
+      }
 
-        // ---- handshake ladder ----
-        function resetLadder() {
-          document.querySelectorAll('.rung').forEach(r => r.className = 'rung');
-          $('ladder').classList.remove('show');
+      /* ---------- pulse ---------- */
+      function renderPulse(p){
+        if(p.chain){
+          $('t_gas').innerHTML=p.chain.baseFeeGwei+'<span class="u">gwei</span>';
+          $('t_block').textContent=p.chain.block.toLocaleString();
+          $('t_cong').textContent=p.chain.congestion;
         }
-        function markStep(n, state) {
-          $('ladder').classList.add('show');
-          document.querySelectorAll('.rung').forEach(r => {
-            const s = Number(r.dataset.step);
-            if (s < n) { r.className = 'rung done'; }
-            else if (s === n) { r.className = 'rung ' + (state || 'active'); }
-          });
-        }
-        function failLadder() {
-          const active = document.querySelector('.rung.active');
-          if (active) active.className = 'rung failed';
-        }
+        $('t_calls').textContent=p.service.callsServed.toLocaleString();
+        $('t_payers').textContent=(p.adoption?p.adoption.uniquePayers:0).toLocaleString();
+        $('r_svc').textContent=p.service.endpoints;
+        $('r_calls').textContent=p.service.callsServed.toLocaleString();
+        const eco=p.ecosystem&&p.ecosystem.x402EndpointsIndexed;
+        if(typeof eco==='number'){$('t_eco').textContent=eco.toLocaleString();
+          $('t_eco_wrap').classList.remove('hidden');}
+        renderCalibration(p);
+        renderChart(p.adoption?p.adoption.series:[]);
+      }
 
-        // ---- helpers ----
-        function randomNonce() {
-          const bytes = new Uint8Array(32);
-          window.crypto.getRandomValues(bytes);
-          return '0x' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      function renderCalibration(p){
+        const c=p.calibration,body=$('calBody');
+        if(!c.forecastsResolved){
+          $('calScope').textContent='';$('r_hit').textContent='—';
+          body.innerHTML='<div class="empty">No forecasts have been resolved yet. Once a '+
+            'journalled decision passes its target block and is audited, the result — held or '+
+            'missed — is published here, misses included.</div>';
+          return;
         }
-        function b64ToJson(v) {
-          try { return JSON.parse(decodeURIComponent(escape(atob(v)))); }
-          catch (e) { try { return JSON.parse(atob(v)); } catch (e2) { return null; } }
-        }
-        function jsonToB64(o) { return btoa(unescape(encodeURIComponent(JSON.stringify(o)))); }
-        function toast(msg, bad) {
-          const el = $('toast');
-          el.className = bad ? 'toast bad' : 'toast';
-          el.textContent = msg;
-          setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000);
-        }
-        function slugify(t) {
-          return (t || 'file').toLowerCase().replace(/[^a-z0-9]+/g, '-')
-            .replace(/^-|-$/g, '').slice(0, 40) || 'file';
-        }
-        const IS_APPLE = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-          (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        const pct=Math.round(c.hitRate*100);
+        $('r_hit').innerHTML=pct+'<small>%</small>';
+        $('calScope').textContent='Last '+c.recent.length+' resolved';
+        const marks=c.recent.map(r=>'<span class="m '+(r.held?'h':'x')+'"></span>').join('');
+        const err=c.medianAbsErrorPct===null?'—':c.medianAbsErrorPct;
+        const h=Math.floor(p.service.processUptimeSeconds/3600);
+        const mn=Math.floor((p.service.processUptimeSeconds%3600)/60);
+        const verdict=pct>88?'running wide.':pct<72?'running narrow.':'close.';
+        body.innerHTML=
+          '<div class="cal"><div class="big">'+pct+'<span>%</span></div>'+
+          '<p>Of <b>'+c.forecastsResolved+' resolved forecasts</b>, the 80% interval contained '+
+          'the actual base fee <b>'+c.intervalContainedActual+' times</b>. A well-calibrated 80% '+
+          'interval should land near 80% — this one is '+verdict+'</p></div>'+
+          '<div class="strip">'+marks+'</div>'+
+          '<div class="key"><span class="h"><i></i>Interval held</span>'+
+          '<span class="x"><i></i>Interval missed</span>'+
+          '<span style="margin-left:auto">Oldest → newest</span></div>'+
+          '<div class="g4">'+
+            '<div class="c4"><div class="l">Resolved</div><div class="v">'+c.forecastsResolved+'</div></div>'+
+            '<div class="c4"><div class="l">Median abs error</div><div class="v">'+err+'<small>%</small></div></div>'+
+            '<div class="c4"><div class="l">Calls served</div><div class="v">'+p.service.callsServed+'</div></div>'+
+            '<div class="c4"><div class="l">Uptime</div><div class="v">'+h+'<small>h</small> '+mn+'<small>m</small></div></div>'+
+          '</div>'+
+          '<p class="vf">Every resolved forecast was checked against a specific Base block and is '+
+          'verifiable on BaseScan. Read the whole record as JSON at '+
+          '<a href="/api/v1/pulse">/api/v1/pulse</a> — free, no payment required.</p>';
+      }
 
-        // ---- x402 V2 handshake, shared by every endpoint ----
-        async function paidCall(method, path, body, step) {
-          step = step || (() => {});
+      /* ---------- adoption chart ---------- */
+      function renderChart(series){
+        const host=$('chartHost');
+        if(!series||!series.length){
+          $('adScope').textContent='';$('adRange').textContent='Awaiting first payment';
+          return;
+        }
+        $('adScope').textContent=series.length+(series.length===1?' day':' days');
+        $('adRange').textContent=series[0].date+' → '+series[series.length-1].date;
 
-          step(1);
-          const init = { method };
-          if (body) { init.headers = { 'Content-Type': 'application/json' }; init.body = JSON.stringify(body); }
-          const probe = await fetch(path, init);
+        const W=760,H=180,PAD={l:0,r:0,t:10,b:22};
+        const iw=W-PAD.l-PAD.r, ih=H-PAD.t-PAD.b;
+        const maxC=Math.max(1,...series.map(d=>d.calls));
+        const maxP=Math.max(1,...series.map(d=>d.payers));
+        const n=series.length;
+        const x=i=>n===1?iw/2:PAD.l+(i/(n-1))*iw;
+        const yC=v=>PAD.t+ih-(v/maxC)*ih;
+        const yP=v=>PAD.t+ih-(v/maxP)*ih;
 
-          if (probe.status !== 402) {
-            const text = await probe.text();
-            if (probe.ok) throw new Error('Served without payment — this route is not gated.\\n' + text);
-            throw new Error('Expected a 402 challenge, got ' + probe.status + '.\\n' + text);
+        const line=(acc,f)=>series.map((d,i)=>(i?'L':'M')+x(i).toFixed(1)+' '+f(d[acc]).toFixed(1)).join(' ');
+        const area=(acc,f)=>line(acc,f)+' L'+x(n-1).toFixed(1)+' '+(PAD.t+ih)+' L'+x(0).toFixed(1)+' '+(PAD.t+ih)+' Z';
+
+        const grid=[0,.5,1].map(t=>'<line x1="0" x2="'+W+'" y1="'+(PAD.t+ih-t*ih).toFixed(1)+
+          '" y2="'+(PAD.t+ih-t*ih).toFixed(1)+'" stroke="#1C3145" stroke-width="1"/>').join('');
+
+        const dots=n<=45?series.map((d,i)=>
+          '<circle cx="'+x(i).toFixed(1)+'" cy="'+yP(d.payers).toFixed(1)+'" r="2.5" fill="#6FC3B8"/>').join(''):'';
+
+        const labels='<text x="2" y="'+(H-6)+'" fill="#4A6076" font-family="IBM Plex Mono" font-size="10">'+
+          series[0].date.slice(5)+'</text>'+
+          '<text x="'+(W-2)+'" y="'+(H-6)+'" fill="#4A6076" font-family="IBM Plex Mono" '+
+          'font-size="10" text-anchor="end">'+series[n-1].date.slice(5)+'</text>'+
+          '<text x="2" y="'+(PAD.t+9)+'" fill="#E8A33D" font-family="IBM Plex Mono" font-size="10">'+
+          maxC+' calls</text>'+
+          '<text x="'+(W-2)+'" y="'+(PAD.t+9)+'" fill="#6FC3B8" font-family="IBM Plex Mono" '+
+          'font-size="10" text-anchor="end">'+maxP+' wallets</text>';
+
+        host.innerHTML='<svg class="chart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" '+
+          'role="img" aria-label="Cumulative calls and paying wallets since the first payment">'+
+          grid+
+          '<path d="'+area('calls',yC)+'" fill="rgba(232,163,61,0.10)"/>'+
+          '<path d="'+line('calls',yC)+'" fill="none" stroke="#E8A33D" stroke-width="1.5" '+
+            'stroke-linejoin="round" vector-effect="non-scaling-stroke"/>'+
+          '<path d="'+line('payers',yP)+'" fill="none" stroke="#6FC3B8" stroke-width="1.5" '+
+            'stroke-linejoin="round" vector-effect="non-scaling-stroke"/>'+
+          dots+labels+'</svg>';
+      }
+
+      async function loadPulse(){
+        try{
+          const r=await fetch('/api/v1/pulse');
+          if(!r.ok)throw new Error('HTTP '+r.status);
+          renderPulse(await r.json());
+        }catch(e){
+          $('calBody').innerHTML='<div class="empty">The record could not be loaded.</div>';
+        }
+      }
+      loadPulse();setInterval(loadPulse,30000);
+
+      /* ---------- x402 handshake ---------- */
+      function randomNonce(){const b=new Uint8Array(32);window.crypto.getRandomValues(b);
+        return '0x'+Array.from(b,x=>x.toString(16).padStart(2,'0')).join('');}
+      function b64ToJson(v){try{return JSON.parse(decodeURIComponent(escape(atob(v))));}
+        catch(e){try{return JSON.parse(atob(v));}catch(e2){return null;}}}
+      function jsonToB64(o){return btoa(unescape(encodeURIComponent(JSON.stringify(o))));}
+      function toast(m,bad){const el=$('toast');el.className=bad?'toast bad':'toast';
+        el.textContent=m;setTimeout(()=>{if(el.textContent===m)el.textContent='';},4000);}
+      function slugify(t){return (t||'file').toLowerCase().replace(/[^a-z0-9]+/g,'-')
+        .replace(/^-|-$/g,'').slice(0,40)||'file';}
+      const IS_APPLE=/iPad|iPhone|iPod/.test(navigator.userAgent)||
+        (navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+
+      function resetLadder(){document.querySelectorAll('.rung').forEach(r=>r.className='rung');
+        $('ladder').classList.remove('show');}
+      function markStep(n){$('ladder').classList.add('show');
+        document.querySelectorAll('.rung').forEach(r=>{const s=Number(r.dataset.step);
+          if(s<n)r.className='rung done';else if(s===n)r.className='rung active';});}
+      function failLadder(){const a=document.querySelector('.rung.active');
+        if(a)a.className='rung failed';}
+
+      async function paidCall(method,path,body,step){
+        step=step||(()=>{});
+        step(1);
+        const init={method};
+        if(body){init.headers={'Content-Type':'application/json'};init.body=JSON.stringify(body);}
+        const probe=await fetch(path,init);
+        if(probe.status!==402){
+          const t=await probe.text();
+          if(probe.ok)throw new Error('Served without payment — this route is not gated.');
+          throw new Error('Expected a 402 challenge, got '+probe.status+'.');
+        }
+        const header=probe.headers.get('PAYMENT-REQUIRED');
+        let challenge=header?b64ToJson(header):null;
+        if(!challenge){try{challenge=await probe.clone().json();}catch(e){}}
+        if(!challenge)throw new Error('402 received but the PAYMENT-REQUIRED header could not be read.');
+        const chosen=(challenge.accepts||[]).find(o=>o.scheme==='exact'&&String(o.network||'').includes('8453'));
+        if(!chosen)throw new Error('No exact/Base payment option was offered.');
+        const chainId=parseInt(String(chosen.network).split(':').pop(),10);
+        const amount=String(chosen.amount??chosen.maxAmountRequired);
+        const asset=chosen.asset,extra=chosen.extra||{};
+        const tokenName=extra.name||'USD Coin',tokenVersion=extra.version||'2';
+        const timeout=chosen.maxTimeoutSeconds||600;
+        if(!amount||amount==='undefined'||!asset)throw new Error('The challenge is missing an amount or asset.');
+
+        step(2);
+        const accounts=await window.ethereum.request({method:'eth_requestAccounts'});
+        const userAddress=accounts[0];
+        const wantHex='0x'+chainId.toString(16);
+        let current=await window.ethereum.request({method:'eth_chainId'});
+        if(current!==wantHex){
+          try{await window.ethereum.request({method:'wallet_switchEthereumChain',
+            params:[{chainId:wantHex}]});}
+          catch(e){
+            if(e.code===4902){await window.ethereum.request({method:'wallet_addEthereumChain',
+              params:[{chainId:'0x2105',chainName:'Base',
+                nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},
+                rpcUrls:['https://mainnet.base.org'],
+                blockExplorerUrls:['https://basescan.org']}]});}
+            else throw new Error('The wallet would not switch to Base: '+(e.message||e.code));
           }
+          current=await window.ethereum.request({method:'eth_chainId'});
+          if(current!==wantHex)throw new Error('Wallet is on chain '+current+'; Base is '+wantHex+'.');
+        }
 
-          const header = probe.headers.get('PAYMENT-REQUIRED');
-          let challenge = header ? b64ToJson(header) : null;
-          if (!challenge) { try { challenge = await probe.clone().json(); } catch (e) {} }
-          if (!challenge) throw new Error('402 received but the PAYMENT-REQUIRED header could not be read.');
+        step(3);
+        const now=Math.floor(Date.now()/1000);
+        const authorization={from:userAddress,to:chosen.payTo,value:amount,
+          validAfter:String(now-300),validBefore:String(now+timeout),nonce:randomNonce()};
+        const typedData={
+          domain:{name:tokenName,version:tokenVersion,chainId,verifyingContract:asset},
+          types:{EIP712Domain:[{name:'name',type:'string'},{name:'version',type:'string'},
+            {name:'chainId',type:'uint256'},{name:'verifyingContract',type:'address'}],
+            TransferWithAuthorization:[{name:'from',type:'address'},{name:'to',type:'address'},
+              {name:'value',type:'uint256'},{name:'validAfter',type:'uint256'},
+              {name:'validBefore',type:'uint256'},{name:'nonce',type:'bytes32'}]},
+          primaryType:'TransferWithAuthorization',message:authorization};
+        const signature=await window.ethereum.request({method:'eth_signTypedData_v4',
+          params:[userAddress,JSON.stringify(typedData)]});
 
-          const chosen = (challenge.accepts || []).find(
-            o => o.scheme === 'exact' && String(o.network || '').includes('8453'));
-          if (!chosen) throw new Error('No exact/Base payment option offered:\\n' + JSON.stringify(challenge));
+        step(4);
+        const paymentPayload={x402Version:challenge.x402Version??2,
+          accepted:{scheme:chosen.scheme,network:chosen.network,amount,asset,payTo:chosen.payTo,
+            maxTimeoutSeconds:timeout,
+            extra:{assetTransferMethod:extra.assetTransferMethod||'eip3009',
+              name:tokenName,version:tokenVersion}},
+          payload:{signature,authorization}};
+        if(challenge.extensions)paymentPayload.extensions=challenge.extensions;
+        paymentPayload.resource=challenge.resource||{
+          url:window.location.origin+path.split('?')[0],description:'',mimeType:'application/json'};
 
-          const chainId = parseInt(String(chosen.network).split(':').pop(), 10);
-          const amount = String(chosen.amount ?? chosen.maxAmountRequired);
-          const asset = chosen.asset;
-          const extra = chosen.extra || {};
-          const tokenName = extra.name || 'USD Coin';
-          const tokenVersion = extra.version || '2';
-          const timeout = chosen.maxTimeoutSeconds || 600;
-          if (!amount || amount === 'undefined' || !asset) {
-            throw new Error('Challenge is missing amount or asset:\\n' + JSON.stringify(chosen));
-          }
+        const headers={'PAYMENT-SIGNATURE':jsonToB64(paymentPayload)};
+        if(body)headers['Content-Type']='application/json';
+        const paid=await fetch(path,{method,headers,body:body?JSON.stringify(body):undefined});
+        const rawBody=await paid.text();
+        const sh=paid.headers.get('PAYMENT-RESPONSE');
+        const settlement=sh?b64ToJson(sh):null;
+        if(!paid.ok){
+          let detail=rawBody;
+          try{const p=JSON.parse(rawBody);detail=p.error||p.errorReason||p.message||rawBody;}catch(e){}
+          throw new Error(detail);
+        }
+        step(5);
+        return {data:JSON.parse(rawBody),settlement};
+      }
 
-          step(2);
-          const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-          const userAddress = accounts[0];
-          const wantHex = '0x' + chainId.toString(16);
-          let current = await window.ethereum.request({ method: 'eth_chainId' });
-          if (current !== wantHex) {
-            try {
-              await window.ethereum.request({
-                method: 'wallet_switchEthereumChain', params: [{ chainId: wantHex }] });
-            } catch (e) {
-              if (e.code === 4902) {
-                await window.ethereum.request({
-                  method: 'wallet_addEthereumChain',
-                  params: [{
-                    chainId: '0x2105', chainName: 'Base',
-                    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-                    rpcUrls: ['https://mainnet.base.org'],
-                    blockExplorerUrls: ['https://basescan.org']
-                  }]
-                });
-              } else throw new Error('The wallet would not switch to Base: ' + (e.message || e.code));
+      function drawBand(low,center,high,actual,held){
+        const lo=Math.min(low,actual===null?low:actual);
+        const hi=Math.max(high,actual===null?high:actual);
+        const pad=(hi-lo)*0.25||Math.max(hi*0.1,0.0001);
+        const min=lo-pad,max=hi+pad,span=max-min||1;
+        const pct=v=>((v-min)/span)*100;
+        let h='<div class="ax"></div>';
+        h+='<div class="rg" style="left:'+pct(low)+'%;width:'+(pct(high)-pct(low))+'%"></div>';
+        h+='<div class="tg up a" style="left:'+pct(low)+'%">'+low+'</div>';
+        h+='<div class="tg up a" style="left:'+pct(high)+'%">'+high+'</div>';
+        h+='<div class="nd" style="left:'+pct(center)+'%"></div>';
+        h+='<div class="tg dn a" style="left:'+pct(center)+'%">forecast '+center+'</div>';
+        if(actual!==null){
+          h+='<div class="ac'+(held?'':' missed')+'" style="left:'+pct(actual)+'%"></div>';
+          h+='<div class="tg dn '+(held?'t':'r')+'" style="left:'+pct(actual)+'%">actual '+actual+'</div>';
+        }
+        $('band').innerHTML=h;$('meter').classList.remove('hidden');
+      }
+
+      function showImage(d){
+        const img=$('image');
+        img.src='data:'+(d.mimeType||'image/webp')+';base64,'+d.image;
+        img.classList.remove('hidden');$('data').classList.add('hidden');
+        $('meter').classList.add('hidden');$('imageActs').classList.remove('hidden');
+        $('textActs').classList.add('hidden');preparePng();
+      }
+      function showData(o){
+        lastText=typeof o==='string'?o:JSON.stringify(o,null,2);
+        $('data').textContent=lastText;$('data').classList.remove('hidden');
+        $('image').classList.add('hidden');$('imageActs').classList.add('hidden');
+        $('textActs').classList.remove('hidden');
+      }
+      function preparePng(){
+        const img=$('image');
+        pngPromise=img.decode().then(()=>{
+          const c=document.createElement('canvas');
+          c.width=img.naturalWidth;c.height=img.naturalHeight;
+          c.getContext('2d').drawImage(img,0,0);
+          return new Promise((res,rej)=>c.toBlob(b=>b?res(b):rej(new Error('encode failed')),'image/png'));
+        }).then(b=>{pngBlob=b;return b;});
+      }
+      function openInTab(){if(!lastResult||!lastResult.imageUrl)return;
+        window.open(lastResult.imageUrl,'_blank');
+        toast('Opened full size — long-press to add to Photos');}
+      function saveImage(){
+        if(!lastResult)return;
+        const name=slugify(lastResult.prompt)+'.png';
+        if(pngBlob){
+          const file=new File([pngBlob],name,{type:'image/png'});
+          if(IS_APPLE&&navigator.canShare&&navigator.canShare({files:[file]})){
+            navigator.share({files:[file]}).catch(e=>{if(e&&e.name!=='AbortError')openInTab();});return;}
+          try{const url=URL.createObjectURL(pngBlob);const a=document.createElement('a');
+            a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();
+            setTimeout(()=>URL.revokeObjectURL(url),10000);toast('Saved to downloads');return;}catch(e){}
+        }
+        openInTab();
+      }
+      function copyImage(){
+        if(!pngPromise)return;
+        if(clipboardBlocked||!navigator.clipboard||!window.ClipboardItem)return shareImage();
+        navigator.clipboard.write([new ClipboardItem({'image/png':pngPromise})])
+          .then(()=>toast('Image copied'))
+          .catch(()=>{clipboardBlocked=true;$('copyImgBtn').textContent='Share image';
+            toast('Clipboard is blocked here — tap again to share',true);});
+      }
+      async function shareImage(){
+        try{
+          const blob=pngBlob||await pngPromise;
+          const file=new File([blob],slugify(lastResult&&lastResult.prompt)+'.png',{type:'image/png'});
+          if(navigator.canShare&&navigator.canShare({files:[file]}))return await navigator.share({files:[file]});
+          throw new Error('unsupported');
+        }catch(e){if(e&&e.name==='AbortError')return;openInTab();}
+      }
+      async function copyLink(){
+        if(!lastResult)return;
+        const link=lastResult.absoluteUrl||(lastResult.imageUrl?window.location.origin+lastResult.imageUrl:null);
+        if(!link)return toast('This result has no stored URL',true);
+        try{await navigator.clipboard.writeText(link);toast('Link copied');}catch(e){toast(link,true);}
+      }
+      async function copyText(){
+        if(!lastText)return;
+        try{await navigator.clipboard.writeText(lastText);toast('Copied');}
+        catch(e){toast('Clipboard is blocked here — select the text instead',true);}
+      }
+      function fileToBase64(file){
+        return new Promise((res,rej)=>{const r=new FileReader();
+          r.onload=()=>res(String(r.result).split(',')[1]);
+          r.onerror=()=>rej(new Error('Could not read that file'));r.readAsDataURL(file);});
+      }
+
+      async function run(){
+        const btn=$('btn'),failBox=$('fail');
+        const fail=m=>{failLadder();failBox.textContent=m;failBox.classList.add('show');};
+        if(!window.ethereum){resetLadder();
+          return fail('No wallet found in this browser. Open this page inside MetaMask, Coinbase Wallet, or Phantom.');}
+
+        lastResult=null;lastText='';pngPromise=null;pngBlob=null;clipboardBlocked=false;
+        $('copyImgBtn').textContent='Copy image';
+        $('out').classList.remove('show');$('meter').classList.add('hidden');
+        $('meterVerdict').className='vd';$('meterVerdict').textContent='';
+        failBox.classList.remove('show');resetLadder();btn.disabled=true;
+        const step=n=>markStep(n);
+
+        try{
+          let settlement=null,metaHtml='';
+          if(mode==='image'){
+            const prompt=$('prompt').value.trim();
+            if(!prompt)throw new Error('Enter a prompt first.');
+            const r=await paidCall('GET','/api/v1/generate-image?prompt='+encodeURIComponent(prompt),null,step);
+            settlement=r.settlement;
+            if(!r.data.image)throw new Error('Payment settled but no image came back.');
+            lastResult=r.data;showImage(r.data);
+            metaHtml='Model '+(r.data.model||'')+' · '+(r.data.mimeType||'');
+          }else if(mode==='pdf'){
+            const url=$('pdfUrl').value.trim(),file=$('pdfFile').files[0];
+            if(!url&&!file)throw new Error('Give a PDF address or choose a file.');
+            const body={};
+            if(file){if(file.size>20*1024*1024)throw new Error('That file is over the 20 MB ceiling.');
+              body.pdf=await fileToBase64(file);}else body.url=url;
+            const r=await paidCall('POST','/api/v1/pdf-to-markdown',body,step);
+            settlement=r.settlement;lastResult=r.data;
+            showData(r.data.markdown||'(no text layer found — this is probably a scan)');
+            metaHtml=r.data.pages+' pages · '+r.data.characters+' characters'+
+              (r.data.title?' · '+r.data.title:'');
+          }else if(mode==='preflight'){
+            const h=Math.max(1,Math.min(60,Number($('horizon1').value)||5));
+            const r=await paidCall('GET','/api/v1/gas/preflight?horizonMinutes='+h,null,step);
+            settlement=r.settlement;lastResult=r.data;
+            const f=r.data.forecast;
+            $('meterTitle').textContent='Fee band · gwei · '+h+' min';
+            drawBand(f.lowGwei,f.centerGwei,f.highGwei,r.data.current.baseFeeGwei,true);
+            $('meterVerdict').textContent=r.data.current.congestion;
+            showData(r.data);
+            metaHtml='Block '+r.data.block+' · base fee '+r.data.current.baseFeeGwei+
+              ' gwei · '+r.data.recent.blocks+' blocks observed';
+          }else if(mode==='decision'){
+            const body={stance:$('stance').value,
+              horizonMinutes:Math.max(1,Math.min(60,Number($('horizon2').value)||15))};
+            const r=await paidCall('POST','/api/v1/gas/decision',body,step);
+            settlement=r.settlement;lastResult=r.data;
+            const s=r.data.snapshot;
+            $('meterTitle').textContent='Fee band at journal time · gwei';
+            drawBand(s.lowGwei,s.centerGwei,s.highGwei,s.baseFeeGwei,true);
+            $('meterVerdict').textContent='recorded';
+            showData(r.data);
+            metaHtml='Auditable from '+new Date(r.data.auditableAt).toLocaleTimeString()+
+              ' · target block '+r.data.targetBlock+'<br>ID '+r.data.decisionId;
+          }else if(mode==='audit'){
+            const id=$('decisionId').value.trim();
+            if(!/^[a-f0-9]{32}$/.test(id))throw new Error('A decision ID is 32 hexadecimal characters.');
+            const r=await paidCall('GET','/api/v1/gas/audit/'+id,null,step);
+            settlement=r.settlement;lastResult=r.data;
+            const f=r.data.forecast;
+            if(r.data.status==='pending'){
+              $('meterTitle').textContent='Fee band · awaiting block '+r.data.targetBlock;
+              drawBand(f.lowGwei,f.centerGwei,f.highGwei,null,true);
+              $('meterVerdict').textContent='pending';
+              metaHtml=r.data.blocksRemaining+' blocks to go · about '+
+                Math.ceil(r.data.secondsRemaining/60)+' min';
+            }else{
+              const held=r.data.rangeContainedActual;
+              $('meterTitle').textContent='Fee band · resolved at block '+r.data.actual.block;
+              drawBand(f.lowGwei,f.centerGwei,f.highGwei,r.data.actual.baseFeeGwei,held);
+              $('meterVerdict').className='vd '+(held?'held':'missed');
+              $('meterVerdict').textContent=held?'range held':'range missed';
+              metaHtml=r.data.explanation+'<br><a href="'+r.data.verify+
+                '" target="_blank" rel="noopener">Verify on BaseScan</a>';
             }
-            current = await window.ethereum.request({ method: 'eth_chainId' });
-            if (current !== wantHex) throw new Error('Wallet is on chain ' + current + '; Base is ' + wantHex + '.');
+            showData(r.data);
           }
-
-          step(3);
-          const now = Math.floor(Date.now() / 1000);
-          const authorization = {
-            from: userAddress, to: chosen.payTo, value: amount,
-            validAfter: String(now - 300), validBefore: String(now + timeout),
-            nonce: randomNonce()
-          };
-          const typedData = {
-            domain: { name: tokenName, version: tokenVersion, chainId, verifyingContract: asset },
-            types: {
-              EIP712Domain: [
-                { name: 'name', type: 'string' }, { name: 'version', type: 'string' },
-                { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }
-              ],
-              TransferWithAuthorization: [
-                { name: 'from', type: 'address' }, { name: 'to', type: 'address' },
-                { name: 'value', type: 'uint256' }, { name: 'validAfter', type: 'uint256' },
-                { name: 'validBefore', type: 'uint256' }, { name: 'nonce', type: 'bytes32' }
-              ]
-            },
-            primaryType: 'TransferWithAuthorization', message: authorization
-          };
-          const signature = await window.ethereum.request({
-            method: 'eth_signTypedData_v4', params: [userAddress, JSON.stringify(typedData)] });
-
-          step(4);
-          const paymentPayload = {
-            x402Version: challenge.x402Version ?? 2,
-            accepted: {
-              scheme: chosen.scheme, network: chosen.network, amount, asset,
-              payTo: chosen.payTo, maxTimeoutSeconds: timeout,
-              extra: {
-                assetTransferMethod: extra.assetTransferMethod || 'eip3009',
-                name: tokenName, version: tokenVersion
-              }
-            },
-            payload: { signature, authorization }
-          };
-          if (challenge.extensions) paymentPayload.extensions = challenge.extensions;
-
-          // In x402 V2 the resource object sits at the TOP LEVEL of the
-          // PaymentRequired challenge, not inside an accepts entry. The
-          // facilitator rejects the Bazaar discovery request without it.
-          paymentPayload.resource = challenge.resource || {
-            url: window.location.origin + path.split('?')[0],
-            description: chosen.description || '',
-            mimeType: chosen.mimeType || 'application/json'
-          };
-
-          const headers = { 'PAYMENT-SIGNATURE': jsonToB64(paymentPayload) };
-          if (body) headers['Content-Type'] = 'application/json';
-          const paid = await fetch(path, {
-            method, headers, body: body ? JSON.stringify(body) : undefined });
-
-          const rawBody = await paid.text();
-          const settleHeader = paid.headers.get('PAYMENT-RESPONSE');
-          const settlement = settleHeader ? b64ToJson(settleHeader) : null;
-
-          if (!paid.ok) {
-            let detail = rawBody;
-            try {
-              const p = JSON.parse(rawBody);
-              detail = p.error || p.errorReason || p.message || rawBody;
-            } catch (e) {}
-            if (settlement) detail += '\\n\\nSettlement: ' + JSON.stringify(settlement);
-            throw new Error(detail);
-          }
-
-          step(5);
-          return { data: JSON.parse(rawBody), settlement };
-        }
-
-        // ---- the fee band ----
-        function drawBand(low, center, high, actual, held) {
-          const lo = Math.min(low, actual === null ? low : actual);
-          const hi = Math.max(high, actual === null ? high : actual);
-          const pad = (hi - lo) * 0.25 || Math.max(hi * 0.1, 0.0001);
-          const min = lo - pad, max = hi + pad, span = max - min || 1;
-          const pct = v => ((v - min) / span) * 100;
-
-          let html = '<div class="axis"></div>';
-          html += '<div class="range" style="left:' + pct(low) + '%;width:' + (pct(high) - pct(low)) + '%"></div>';
-          html += '<div class="tag hi amber" style="left:' + pct(low) + '%">' + low + '</div>';
-          html += '<div class="tag hi amber" style="left:' + pct(high) + '%">' + high + '</div>';
-          html += '<div class="needle" style="left:' + pct(center) + '%"></div>';
-          html += '<div class="tag amber" style="left:' + pct(center) + '%">forecast ' + center + '</div>';
-
-          if (actual !== null) {
-            const cls = held ? '' : ' missed';
-            const tagCls = held ? 'teal' : 'red';
-            html += '<div class="actual' + cls + '" style="left:' + pct(actual) + '%"></div>';
-            html += '<div class="tag ' + tagCls + '" style="left:' + pct(actual) + '%;top:46px">actual ' + actual + '</div>';
-          }
-
-          $('band').innerHTML = html;
-          $('meter').classList.remove('hidden');
-        }
-
-        // ---- output renderers ----
-        function showImage(data) {
-          const img = $('image');
-          img.src = 'data:' + (data.mimeType || 'image/webp') + ';base64,' + data.image;
-          img.classList.remove('hidden');
-          $('data').classList.add('hidden');
-          $('meter').classList.add('hidden');
-          $('imageActs').classList.remove('hidden');
-          $('textActs').classList.add('hidden');
-          preparePng();
-        }
-        function showData(obj) {
-          lastText = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
-          $('data').textContent = lastText;
-          $('data').classList.remove('hidden');
-          $('image').classList.add('hidden');
-          $('imageActs').classList.add('hidden');
-          $('textActs').classList.remove('hidden');
-        }
-
-        // ---- image helpers ----
-        function preparePng() {
-          const img = $('image');
-          pngPromise = img.decode().then(() => {
-            const c = document.createElement('canvas');
-            c.width = img.naturalWidth; c.height = img.naturalHeight;
-            c.getContext('2d').drawImage(img, 0, 0);
-            return new Promise((res, rej) =>
-              c.toBlob(b => (b ? res(b) : rej(new Error('encode failed'))), 'image/png'));
-          }).then(b => { pngBlob = b; return b; });
-        }
-        function openInTab() {
-          if (!lastResult || !lastResult.imageUrl) return;
-          window.open(lastResult.imageUrl, '_blank');
-          toast('Opened full size — long-press to add to Photos');
-        }
-        function saveImage() {
-          if (!lastResult) return;
-          const name = slugify(lastResult.prompt) + '.png';
-          if (pngBlob) {
-            const file = new File([pngBlob], name, { type: 'image/png' });
-            if (IS_APPLE && navigator.canShare && navigator.canShare({ files: [file] })) {
-              navigator.share({ files: [file] })
-                .catch(e => { if (e && e.name !== 'AbortError') openInTab(); });
-              return;
-            }
-            try {
-              const url = URL.createObjectURL(pngBlob);
-              const a = document.createElement('a');
-              a.href = url; a.download = name;
-              document.body.appendChild(a); a.click(); a.remove();
-              setTimeout(() => URL.revokeObjectURL(url), 10000);
-              toast('Saved to downloads');
-              return;
-            } catch (e) {}
-          }
-          openInTab();
-        }
-        function copyImage() {
-          if (!pngPromise) return;
-          if (clipboardBlocked || !navigator.clipboard || !window.ClipboardItem) return shareImage();
-          navigator.clipboard.write([new ClipboardItem({ 'image/png': pngPromise })])
-            .then(() => toast('Image copied'))
-            .catch(() => {
-              clipboardBlocked = true;
-              $('copyImgBtn').textContent = 'Share image';
-              toast('Clipboard is blocked here — tap again to share', true);
-            });
-        }
-        async function shareImage() {
-          try {
-            const blob = pngBlob || await pngPromise;
-            const file = new File([blob], slugify(lastResult && lastResult.prompt) + '.png',
-              { type: 'image/png' });
-            if (navigator.canShare && navigator.canShare({ files: [file] })) {
-              return await navigator.share({ files: [file] });
-            }
-            throw new Error('unsupported');
-          } catch (e) {
-            if (e && e.name === 'AbortError') return;
-            openInTab();
-          }
-        }
-        async function copyLink() {
-          if (!lastResult) return;
-          const link = lastResult.absoluteUrl ||
-            (lastResult.imageUrl ? window.location.origin + lastResult.imageUrl : null);
-          if (!link) return toast('This result has no stored URL', true);
-          try { await navigator.clipboard.writeText(link); toast('Link copied'); }
-          catch (e) { toast(link, true); }
-        }
-        async function copyText() {
-          if (!lastText) return;
-          try { await navigator.clipboard.writeText(lastText); toast('Copied'); }
-          catch (e) { toast('Clipboard is blocked here — select the text instead', true); }
-        }
-        function fileToBase64(file) {
-          return new Promise((res, rej) => {
-            const r = new FileReader();
-            r.onload = () => res(String(r.result).split(',')[1]);
-            r.onerror = () => rej(new Error('Could not read that file'));
-            r.readAsDataURL(file);
-          });
-        }
-
-        // ---- main ----
-        async function run() {
-          const btn = $('btn');
-          const failBox = $('fail');
-
-          const fail = m => {
-            failLadder();
-            failBox.textContent = m;
-            failBox.classList.add('show');
-          };
-
-          if (!window.ethereum) {
-            resetLadder();
-            return fail('No wallet found in this browser. Open this page inside MetaMask, Coinbase Wallet, or Phantom.');
-          }
-
-          lastResult = null; lastText = ''; pngPromise = null; pngBlob = null; clipboardBlocked = false;
-          $('copyImgBtn').textContent = 'Copy image';
-          $('out').classList.remove('show');
-          $('meter').classList.add('hidden');
-          $('meterVerdict').className = 'verdict';
-          $('meterVerdict').textContent = '';
-          failBox.classList.remove('show');
-          resetLadder();
-          btn.disabled = true;
-
-          const step = n => markStep(n);
-
-          try {
-            let settlement = null;
-            let metaHtml = '';
-
-            if (mode === 'image') {
-              const prompt = $('prompt').value.trim();
-              if (!prompt) throw new Error('Enter a prompt first.');
-              const r = await paidCall('GET',
-                '/api/v1/generate-image?prompt=' + encodeURIComponent(prompt), null, step);
-              settlement = r.settlement;
-              if (!r.data.image) throw new Error('Payment settled but no image came back.');
-              lastResult = r.data;
-              showImage(r.data);
-              metaHtml = 'Model ' + (r.data.model || '') + ' · ' + (r.data.mimeType || '');
-
-            } else if (mode === 'pdf') {
-              const url = $('pdfUrl').value.trim();
-              const file = $('pdfFile').files[0];
-              if (!url && !file) throw new Error('Give a PDF address or choose a file.');
-              const body = {};
-              if (file) {
-                if (file.size > 20 * 1024 * 1024) throw new Error('That file is over the 20 MB ceiling.');
-                body.pdf = await fileToBase64(file);
-              } else body.url = url;
-
-              const r = await paidCall('POST', '/api/v1/pdf-to-markdown', body, step);
-              settlement = r.settlement;
-              lastResult = r.data;
-              showData(r.data.markdown || '(no text layer found — this PDF is probably a scan)');
-              metaHtml = r.data.pages + ' pages · ' + r.data.characters + ' characters' +
-                (r.data.title ? ' · ' + r.data.title : '');
-
-            } else if (mode === 'preflight') {
-              const h = Math.max(1, Math.min(60, Number($('horizon1').value) || 5));
-              const r = await paidCall('GET', '/api/v1/gas/preflight?horizonMinutes=' + h, null, step);
-              settlement = r.settlement;
-              lastResult = r.data;
-              const f = r.data.forecast;
-              $('meterTitle').textContent = 'Fee band · gwei · ' + h + ' min';
-              drawBand(f.lowGwei, f.centerGwei, f.highGwei, r.data.current.baseFeeGwei, true);
-              $('meterVerdict').textContent = r.data.current.congestion;
-              showData(r.data);
-              metaHtml = 'Block ' + r.data.block + ' · base fee ' +
-                r.data.current.baseFeeGwei + ' gwei · ' + r.data.recent.blocks + ' blocks observed';
-
-            } else if (mode === 'decision') {
-              const body = {
-                stance: $('stance').value,
-                horizonMinutes: Math.max(1, Math.min(60, Number($('horizon2').value) || 15))
-              };
-              const r = await paidCall('POST', '/api/v1/gas/decision', body, step);
-              settlement = r.settlement;
-              lastResult = r.data;
-              const s = r.data.snapshot;
-              $('meterTitle').textContent = 'Fee band at journal time · gwei';
-              drawBand(s.lowGwei, s.centerGwei, s.highGwei, s.baseFeeGwei, true);
-              $('meterVerdict').textContent = 'recorded';
-              showData(r.data);
-              metaHtml = 'Auditable from ' + new Date(r.data.auditableAt).toLocaleTimeString() +
-                ' · target block ' + r.data.targetBlock + '<br>ID ' + r.data.decisionId;
-
-            } else if (mode === 'audit') {
-              const id = $('decisionId').value.trim();
-              if (!/^[a-f0-9]{32}$/.test(id)) throw new Error('A decision ID is 32 hexadecimal characters.');
-              const r = await paidCall('GET', '/api/v1/gas/audit/' + id, null, step);
-              settlement = r.settlement;
-              lastResult = r.data;
-              const f = r.data.forecast;
-
-              if (r.data.status === 'pending') {
-                $('meterTitle').textContent = 'Fee band · awaiting block ' + r.data.targetBlock;
-                drawBand(f.lowGwei, f.centerGwei, f.highGwei, null, true);
-                $('meterVerdict').textContent = 'pending';
-                metaHtml = r.data.blocksRemaining + ' blocks to go · about ' +
-                  Math.ceil(r.data.secondsRemaining / 60) + ' min';
-              } else {
-                const held = r.data.rangeContainedActual;
-                $('meterTitle').textContent = 'Fee band · resolved at block ' + r.data.actual.block;
-                drawBand(f.lowGwei, f.centerGwei, f.highGwei, r.data.actual.baseFeeGwei, held);
-                $('meterVerdict').className = 'verdict ' + (held ? 'held' : 'missed');
-                $('meterVerdict').textContent = held ? 'range held' : 'range missed';
-                metaHtml = r.data.explanation +
-                  '<br><a href="' + r.data.verify + '" target="_blank" rel="noopener">Verify on BaseScan</a>';
-              }
-              showData(r.data);
-            }
-
-            const tx = settlement && settlement.transaction;
-            if (tx) {
-              metaHtml += (metaHtml ? '<br>' : '') +
-                'Receipt <a href="https://basescan.org/tx/' + tx +
-                '" target="_blank" rel="noopener">' + tx.slice(0, 18) + '…</a>';
-            }
-            $('meta').innerHTML = metaHtml;
-            $('out').classList.add('show');
-            markStep(6);   // all five rungs resolve to done
-          } catch (err) {
-            fail(err.message || String(err));
-            console.error(err);
-          } finally {
-            btn.disabled = false;
-          }
-        }
-
-        switchMode();
-      </script>
+          const tx=settlement&&settlement.transaction;
+          if(tx)metaHtml+=(metaHtml?'<br>':'')+'Receipt <a href="https://basescan.org/tx/'+tx+
+            '" target="_blank" rel="noopener">'+tx.slice(0,18)+'…</a>';
+          $('meta').innerHTML=metaHtml;$('out').classList.add('show');markStep(6);
+          setTimeout(loadPulse,2500);
+        }catch(err){
+          fail(err.message||String(err));console.error(err);
+        }finally{btn.disabled=false;}
+      }
+    </script>
     </body>
     </html>
   `);
@@ -1753,6 +1905,106 @@ app.get('/api/v1/image/:id', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// 4b. Public pulse — free, unauthenticated, cached.
+//
+//     Registered before the payment middleware so it stays free. Cached hard,
+//     because a free endpoint that hits Base RPC on every request is a cost
+//     and rate-limit vector. Agents can read this to decide whether to trust
+//     the paid forecasts before spending anything.
+// ---------------------------------------------------------------------------
+const PULSE_TTL_MS = 20000;
+const BAZAAR_TTL_MS = 10 * 60 * 1000;
+let pulseCache = { at: 0, data: null };
+let bazaarCache = { at: 0, count: null };
+
+async function bazaarEndpointCount() {
+  if (Date.now() - bazaarCache.at < BAZAAR_TTL_MS) return bazaarCache.count;
+  bazaarCache.at = Date.now();
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch(
+      'https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources?limit=1',
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    // Shape varies; take whichever total the response actually carries.
+    const total = json.pagination?.total ?? json.total ?? json.count ?? null;
+    bazaarCache.count = typeof total === 'number' ? total : null;
+  } catch (err) {
+    // Not fatal — the UI simply omits the tile when this is null.
+    bazaarCache.count = null;
+  }
+  return bazaarCache.count;
+}
+
+app.get('/api/v1/pulse', async (req, res) => {
+  if (pulseCache.data && Date.now() - pulseCache.at < PULSE_TTL_MS) {
+    res.set('Cache-Control', 'public, max-age=20');
+    return res.json(pulseCache.data);
+  }
+
+  const cal = stats.calibration;
+  const hitRate = cal.resolved ? cal.contained / cal.resolved : null;
+  const medianErr = medianOf(cal.absErrors);
+
+  const payload = {
+    service: {
+      name: 'Lotus Network API',
+      url: BASE_URL,
+      endpoints: ENDPOINTS.length,
+      callsServed: stats.callsServed,
+      byEndpoint: stats.byEndpoint,
+      since: stats.since,
+      processUptimeSeconds: Math.round(process.uptime())
+    },
+    adoption: {
+      uniquePayers: stats.payers.length,
+      series: buildSeries(),
+      note:
+        'uniquePayers counts distinct wallet addresses that have settled a payment to this ' +
+        'API, read from the EIP-3009 authorization. It is not a count of agents: nothing ' +
+        'on-chain distinguishes an autonomous agent from a person with a wallet. The series ' +
+        'begins on the first day of recorded activity and extends as data accumulates.'
+    },
+    calibration: {
+      targetInterval: 0.8,
+      forecastsResolved: cal.resolved,
+      intervalContainedActual: cal.contained,
+      hitRate: hitRate === null ? null : Number(hitRate.toFixed(4)),
+      medianAbsErrorPct: medianErr === null ? null : Number(medianErr.toFixed(2)),
+      recent: cal.recent,
+      note:
+        'Each entry is a gas forecast that was journalled, then checked against the base fee ' +
+        'at its target block. A well-calibrated 80% interval should contain the actual value ' +
+        'about 80% of the time. Every figure is reproducible from public Base RPC data.'
+    },
+    generatedAt: new Date().toISOString()
+  };
+
+  // Chain and ecosystem reads can fail without invalidating the rest.
+  try {
+    const s = await gasSnapshot(5);
+    payload.chain = {
+      network: 'base-mainnet',
+      block: s.currentBlock,
+      baseFeeGwei: round(weiToGwei(s.current)),
+      congestion: s.congestion
+    };
+  } catch (err) {
+    payload.chain = null;
+  }
+
+  payload.ecosystem = { x402EndpointsIndexed: await bazaarEndpointCount() };
+
+  pulseCache = { at: Date.now(), data: payload };
+  res.set('Cache-Control', 'public, max-age=20');
+  res.json(payload);
+});
+
+// ---------------------------------------------------------------------------
 // 5. Diagnostics, then route protection
 // ---------------------------------------------------------------------------
 app.use('/api', (req, res, next) => {
@@ -1764,6 +2016,16 @@ app.use('/api', (req, res, next) => {
       console.warn('[x402] client sent V1 X-PAYMENT; V2 expects PAYMENT-SIGNATURE');
     }
     console.log(`[x402] paid request: ${req.method} ${req.path}`);
+
+    // The payer address is inside the EIP-3009 authorization the client signed.
+    let payer = null;
+    try {
+      const decoded = JSON.parse(Buffer.from(sig, 'base64').toString('utf8'));
+      payer = decoded?.payload?.authorization?.from || null;
+    } catch (e) {
+      // A malformed header is the middleware's problem, not ours.
+    }
+    recordCall(`${req.method} ${req.path}`, payer);
   }
   next();
 });
@@ -2073,6 +2335,13 @@ app.get('/api/v1/gas/audit/:decisionId', async (req, res) => {
 
     let withinBudget = null;
     if (record.maxFeeGwei !== null) withinBudget = actualGwei <= record.maxFeeGwei;
+
+    // Count each decision once, however many times it is audited afterwards.
+    if (!record.auditRecorded) {
+      recordAudit({ held: contained, changePct });
+      record.auditRecorded = true;
+      storeDecision(id, record).catch(e => console.error('[gas] could not mark audited:', e.message));
+    }
 
     console.log(`[gas] audit ${id} actual=${actualGwei} contained=${contained}`);
 
