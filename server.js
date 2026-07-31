@@ -1123,7 +1123,7 @@ app.get('/', (req, res) => {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>Lotus Network — metered services on Base</title>
-      <meta name="description" content="Five pay-per-call services on Base, settled in USDC over x402. No key, no account, no subscription.">
+      <meta name="description" content="Seven pay-per-call services on Base, settled in USDC over x402: video and image generation, transcription, PDF-to-Markdown, and an auditable gas forecasting loop. No key, no account, no subscription.">
       <link rel="icon" href="/favicon.svg" type="image/svg+xml">
       <link rel="alternate icon" href="/favicon.ico" sizes="any">
       <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -2128,10 +2128,11 @@ app.get('/openapi.json', (req, res) => {
     info: {
       title: 'Lotus Network API',
       description:
-        'Pay-per-call AI, document, and on-chain data services on Base. Image generation, ' +
-        'PDF-to-Markdown conversion, and an auditable Base gas forecasting loop. ' +
-        'No API key, account, or subscription.',
-      version: '1.2.0',
+        'Seven pay-per-call services on Base, settled in USDC over x402: video generation, ' +
+        'image generation, audio and video transcription, PDF-to-Markdown conversion, and an ' +
+        'auditable gas forecasting loop that journals a prediction and later verifies it against ' +
+        'the chain. No API key, account, or subscription.',
+      version: '1.3.0',
       contact: { email: CONTACT_EMAIL }
     },
     servers: [{ url: BASE_URL }],
@@ -2154,6 +2155,17 @@ Contact: ${CONTACT_EMAIL}
 
 ## Endpoints
 
+POST /api/v1/video ($${PRICE_VIDEO})
+  Text-to-video or image-to-video at 1080p, up to five seconds.
+  Body: {"prompt": "...", "imageUrl": "https://...", "durationSeconds": 5}
+  Returns a jobId immediately. Poll GET /api/v1/jobs/{jobId} (free) until
+  status is completed, then collect the MP4 from result.videoUrl.
+
+POST /api/v1/transcribe ($${PRICE_TRANSCRIBE})
+  Audio or video to timestamped text. Body: {"audioUrl": "https://..."}
+  Optional: language (ISO code), translate (boolean).
+  Returns a jobId. Poll GET /api/v1/jobs/{jobId} (free) for the transcript.
+
 GET /api/v1/generate-image?prompt=... ($${PRICE_IMAGE})
   Text-to-image via FLUX. Returns base64 plus a durable URL.
   Add &format=binary for raw image bytes instead of JSON.
@@ -2174,6 +2186,18 @@ POST /api/v1/gas/decision ($${PRICE_DECISION})
 GET /api/v1/gas/audit/{decisionId} ($${PRICE_AUDIT})
   Verifies a journalled decision against the actual base fee at the target
   block. Returns status "pending" if that block has not been reached.
+
+## Free endpoints
+
+GET /api/v1/jobs/{jobId}
+  Status and result for a video or transcription job. Free — the work was
+  already paid for when the job was created. Poll rather than re-paying.
+
+GET /api/v1/asset/{id}
+  Durable URL for a generated MP4. Free.
+
+GET /api/v1/pulse
+  Calls served, unique paying wallets, and the calibration record as JSON.
 
 ## The gas loop
 
