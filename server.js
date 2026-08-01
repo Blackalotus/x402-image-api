@@ -23,7 +23,7 @@ const BASE_URL = process.env.BASE_URL || 'https://lotusnetworkapi.com';
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || 'blacklotusfinance.pls@gmail.com';
 
 const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
-const REPLICATE_MODEL = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell';
+const REPLICATE_MODEL = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-2-pro';
 
 const CDP_KEY_ID = process.env.CDP_API_KEY_ID;
 const CDP_KEY_SECRET = process.env.CDP_API_KEY_SECRET;
@@ -36,7 +36,7 @@ const RETENTION_DAYS = Number(process.env.IMAGE_RETENTION_DAYS || 30);
 
 const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
 
-const PRICE_IMAGE = process.env.PRICE_IMAGE || '0.05';
+const PRICE_IMAGE = process.env.PRICE_IMAGE || '0.08';
 const PRICE_PDF = process.env.PRICE_PDF || '0.005';
 const PRICE_PREFLIGHT = process.env.PRICE_PREFLIGHT || '0.002';
 const PRICE_DECISION = process.env.PRICE_DECISION || '0.003';
@@ -80,7 +80,7 @@ const ENDPOINTS = [
     summary: 'Generate an image from a text prompt',
     tags: ['Media'],
     description:
-      'Text-to-image generation powered by FLUX. Send a prompt, get back a 1024x1024 image as ' +
+      'Text-to-image generation powered by FLUX.2 [pro]. Send a prompt, get back a 1024x1024 image as ' +
       'base64 JSON or raw bytes, plus a durable direct URL. No API key or account needed.',
     parameters: [
       {
@@ -106,7 +106,7 @@ const ENDPOINTS = [
     outputExample: {
       success: true,
       prompt: 'a cyberpunk city skyline at dusk, neon reflections',
-      model: 'black-forest-labs/flux-schnell',
+      model: 'black-forest-labs/flux-2-pro',
       mimeType: 'image/webp',
       image: '<base64-encoded image bytes>',
       absoluteUrl: `${BASE_URL}/api/v1/image/9f2c4a1e7b3d5f8091a2b3c4d5e6f708`
@@ -1418,7 +1418,7 @@ app.get('/', (req, res) => {
             </div>
             <div class="row" data-mode="image">
               <span class="meth">GET</span><span class="nm">Image generation</span><span class="pr">$${PRICE_IMAGE}</span>
-              <span class="ds">FLUX text-to-image. Returns the bytes plus a durable URL.</span>
+              <span class="ds">FLUX.2 [pro] text-to-image. Returns the bytes plus a durable URL.</span>
               <span class="pt">/api/v1/generate-image</span>
             </div>
             <div class="row" data-mode="transcribe">
@@ -2132,7 +2132,7 @@ app.get('/openapi.json', (req, res) => {
         'image generation, audio and video transcription, PDF-to-Markdown conversion, and an ' +
         'auditable gas forecasting loop that journals a prediction and later verifies it against ' +
         'the chain. No API key, account, or subscription.',
-      version: '1.3.0',
+      version: '1.4.0',
       contact: { email: CONTACT_EMAIL }
     },
     servers: [{ url: BASE_URL }],
@@ -2167,7 +2167,7 @@ POST /api/v1/transcribe ($${PRICE_TRANSCRIBE})
   Returns a jobId. Poll GET /api/v1/jobs/{jobId} (free) for the transcript.
 
 GET /api/v1/generate-image?prompt=... ($${PRICE_IMAGE})
-  Text-to-image via FLUX. Returns base64 plus a durable URL.
+  Text-to-image via FLUX.2 [pro]. Returns base64 plus a durable URL.
   Add &format=binary for raw image bytes instead of JSON.
 
 POST /api/v1/pdf-to-markdown ($${PRICE_PDF})
@@ -2519,7 +2519,7 @@ for (const ep of ENDPOINTS) {
 app.use(paymentMiddleware(routes, x402Server));
 
 // ---------------------------------------------------------------------------
-// 6. Image generation via Replicate
+// 6. Image generation via Replicate — FLUX.2 [pro]
 // ---------------------------------------------------------------------------
 async function replicateGenerate(prompt) {
   if (!REPLICATE_TOKEN) throw new Error('REPLICATE_API_TOKEN is not set on the server');
@@ -2535,8 +2535,17 @@ async function replicateGenerate(prompt) {
       headers: { ...headers, Prefer: 'wait=55' },
       body: JSON.stringify({
         input: {
-          prompt, num_outputs: 1, aspect_ratio: '1:1',
-          output_format: 'webp', output_quality: 90
+          prompt,
+          aspect_ratio: '1:1',
+          // Pinned, not caller-controllable. Replicate bills flux-2-pro per
+          // megapixel of output, so letting a caller ask for 4 MP would cost
+          // several times what this route charges.
+          resolution: '1 MP',
+          // Public unauthenticated endpoint: there is no account to ban, so
+          // keep the model's own filter strict rather than permissive.
+          safety_tolerance: 2,
+          output_format: 'webp',
+          output_quality: 90
         }
       })
     }
