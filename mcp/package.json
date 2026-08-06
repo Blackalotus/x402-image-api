@@ -1,0 +1,31 @@
+{
+  "name": "lotus-network-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing the Lotus Network x402 API as tools. Pays per call in USDC on Base.",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "lotus-network-mcp": "index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "x402",
+    "base",
+    "usdc",
+    "agent",
+    "micropayments"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "express": "^4.19.2",
+    "viem": "^2.21.0",
+    "zod": "^3.23.8"
+  }
+}
