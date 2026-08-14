@@ -13,6 +13,7 @@ import {
 } from '@x402/extensions/bazaar';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { PDFParse } from 'pdf-parse';
+import { createPatronModule } from './patron.js';
 
 const app = express();
 app.set('trust proxy', true);
@@ -446,8 +447,32 @@ const ENDPOINTS = [
         explanation: { type: 'string' }
       }
     }
-  }
+  },
+  ...patron.PATRON_TIERS.map(tier => ({
+    method: 'POST',
+    path: tier.path,
+    price: String(tier.priceUsd),
+    operationId: `pledge${tier.key.charAt(0).toUpperCase() + tier.key.slice(1)}`,
+    summary: `Pledge as a ${tier.label} (1 month)`,
+    tags: ['Patron'],
+    description:
+      `Recurring monthly pledge of $${tier.priceUsd} USDC supporting Lotus Network. Grants ${tier.label} ` +
+      `status for 30 days. This is a support tier, not a verified safety or behavior score.`,
+    requestBody: {
+      required: true,
+      content: { 'application/json': { schema: { type: 'object',
+        properties: { walletAddress: { type: 'string' } } },
+        example: { walletAddress: '0xYourWalletAddress' } } }
+    },
+    inputExample: { walletAddress: '0xYourWalletAddress' },
+    inputSchema: { properties: { walletAddress: { type: 'string' } } },
+    outputExample: { success: true, wallet: '0x...', tier: tier.key, tierLabel: tier.label,
+      pledgedAt: '2026-08-13T00:00:00.000Z', expiresAt: '2026-09-12T00:00:00.000Z' },
+    outputSchema: { properties: { success: { type: 'boolean' }, wallet: { type: 'string' },
+      tier: { type: 'string' }, expiresAt: { type: 'string' } } }
+  }))
 ];
+
 
 // ---------------------------------------------------------------------------
 // Storage. R2 is the durable store for both images and decision records; a
@@ -466,6 +491,8 @@ const r2 = r2Enabled
 if (!r2Enabled) {
   console.warn('[storage] R2 not configured — images and decision records will not survive a restart.');
 }
+
+const patron = createPatronModule({ r2, bucket: R2_BUCKET });
 
 const HOT_CACHE_MAX = 30;
 const hotCache = new Map();
@@ -1390,6 +1417,7 @@ app.get('/', (req, res) => {
           <a href="#record">Calibration record</a>
           <a href="#adoption">Adoption</a>
           <a href="#try">Try it</a>
+          <a href="#patron">Patron tiers</a>
           <a href="/openapi.json">OpenAPI ↗</a>
           <a href="/llms.txt">llms.txt ↗</a>
         </nav>
@@ -1447,6 +1475,32 @@ app.get('/', (req, res) => {
               <span class="pt">/api/v1/gas/audit/{id}</span>
             </div>
           </div>
+        </section>
+
+        <section id="patron">
+          <div class="sl"><span class="n">05</span><h2>Patron tiers</h2><span class="r">Monthly · USDC</span></div>
+          <p class="sd">A recurring monthly pledge supporting Lotus Network — a support tier, not a
+            verified safety or behavior score. Lapses after 30 days unless renewed.</p>
+          <div class="rate">
+            <div class="row">
+              <span class="meth">POST</span><span class="nm">Lotus Supporter</span><span class="pr">$5/mo</span>
+              <span class="ds">Entry-level monthly pledge.</span>
+              <span class="pt">/api/v1/patron/pledge/supporter</span>
+            </div>
+            <div class="row">
+              <span class="meth">POST</span><span class="nm">Lotus Advocate</span><span class="pr">$15/mo</span>
+              <span class="ds">Mid-tier monthly pledge.</span>
+              <span class="pt">/api/v1/patron/pledge/advocate</span>
+            </div>
+            <div class="row">
+              <span class="meth">POST</span><span class="nm">Lotus Champion</span><span class="pr">$50/mo</span>
+              <span class="ds">Top-tier monthly pledge.</span>
+              <span class="pt">/api/v1/patron/pledge/champion</span>
+            </div>
+          </div>
+          <p class="vf">Check any wallet's status free at
+            <a href="/api/v1/patron/status/0xYourAddress">/api/v1/patron/status/{wallet}</a>, or its
+            usage-based Trust Score at <a href="/api/v1/trust/0xYourAddress">/api/v1/trust/{wallet}</a>.</p>
         </section>
 
         <section id="record">
@@ -2299,6 +2353,9 @@ async function bazaarEndpointCount() {
   return bazaarCache.count;
 }
 
+app.get('/api/v1/patron/status/:walletAddress', patron.statusHandler);
+app.get('/api/v1/trust/:walletAddress', patron.trustHandler);
+
 app.get('/api/v1/pulse', async (req, res) => {
   if (pulseCache.data && Date.now() - pulseCache.at < PULSE_TTL_MS) {
     res.set('Cache-Control', 'public, max-age=20');
@@ -2488,6 +2545,7 @@ app.use('/api', (req, res, next) => {
       // A malformed header is the middleware's problem, not ours.
     }
     recordCall(`${req.method} ${req.path}`, payer);
+    if (payer) { req.walletFromPayment = payer; patron.logUsage(payer, `${req.method} ${req.path}`); }
   }
   next();
 });
@@ -2517,6 +2575,10 @@ for (const ep of ENDPOINTS) {
 }
 
 app.use(paymentMiddleware(routes, x402Server));
+
+for (const tier of patron.PATRON_TIERS) {
+  app.post(tier.path, patron.pledgeHandler(tier.key));
+}
 
 // ---------------------------------------------------------------------------
 // 6. Image generation via Replicate — FLUX.2 [pro]
