@@ -448,29 +448,7 @@ const ENDPOINTS = [
       }
     }
   },
-  ...patron.PATRON_TIERS.map(tier => ({
-    method: 'POST',
-    path: tier.path,
-    price: String(tier.priceUsd),
-    operationId: `pledge${tier.key.charAt(0).toUpperCase() + tier.key.slice(1)}`,
-    summary: `Pledge as a ${tier.label} (1 month)`,
-    tags: ['Patron'],
-    description:
-      `Recurring monthly pledge of $${tier.priceUsd} USDC supporting Lotus Network. Grants ${tier.label} ` +
-      `status for 30 days. This is a support tier, not a verified safety or behavior score.`,
-    requestBody: {
-      required: true,
-      content: { 'application/json': { schema: { type: 'object',
-        properties: { walletAddress: { type: 'string' } } },
-        example: { walletAddress: '0xYourWalletAddress' } } }
-    },
-    inputExample: { walletAddress: '0xYourWalletAddress' },
-    inputSchema: { properties: { walletAddress: { type: 'string' } } },
-    outputExample: { success: true, wallet: '0x...', tier: tier.key, tierLabel: tier.label,
-      pledgedAt: '2026-08-13T00:00:00.000Z', expiresAt: '2026-09-12T00:00:00.000Z' },
-    outputSchema: { properties: { success: { type: 'boolean' }, wallet: { type: 'string' },
-      tier: { type: 'string' }, expiresAt: { type: 'string' } } }
-  }))
+ 
 ];
 
 
@@ -493,6 +471,30 @@ if (!r2Enabled) {
 }
 
 const patron = createPatronModule({ r2, bucket: R2_BUCKET });
+
+ENDPOINTS.push(...patron.PATRON_TIERS.map(tier => ({
+  method: 'POST',
+  path: tier.path,
+  price: String(tier.priceUsd),
+  operationId: `pledge${tier.key.charAt(0).toUpperCase() + tier.key.slice(1)}`,
+  summary: `Pledge as a ${tier.label} (1 month)`,
+  tags: ['Patron'],
+  description:
+    `Recurring monthly pledge of $${tier.priceUsd} USDC supporting Lotus Network. Grants ${tier.label} ` +
+    `status for 30 days. This is a support tier, not a verified safety or behavior score.`,
+  requestBody: {
+    required: true,
+    content: { 'application/json': { schema: { type: 'object',
+      properties: { walletAddress: { type: 'string' } } },
+      example: { walletAddress: '0xYourWalletAddress' } } }
+  },
+  inputExample: { walletAddress: '0xYourWalletAddress' },
+  inputSchema: { properties: { walletAddress: { type: 'string' } } },
+  outputExample: { success: true, wallet: '0x...', tier: tier.key, tierLabel: tier.label,
+    pledgedAt: '2026-08-13T00:00:00.000Z', expiresAt: '2026-09-12T00:00:00.000Z' },
+  outputSchema: { properties: { success: { type: 'boolean' }, wallet: { type: 'string' },
+    tier: { type: 'string' }, expiresAt: { type: 'string' } } }
+})));
 
 const HOT_CACHE_MAX = 30;
 const hotCache = new Map();
