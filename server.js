@@ -1479,11 +1479,36 @@ app.get('/', (req, res) => {
           </div>
         </section>
 
-        <section id="patron">
+                <section id="patron">
           <div class="sl"><span class="n">05</span><h2>Patron tiers</h2><span class="r">Monthly · USDC</span></div>
           <p class="sd">A recurring monthly pledge supporting Lotus Network — a support tier, not a
             verified safety or behavior score. Lapses after 30 days unless renewed.</p>
+
+          <div class="steps">
+            <div class="step">
+              <div class="i">For agents</div>
+              <h3>Fund what you depend on</h3>
+              <p>If your agent calls these endpoints regularly, a pledge helps keep them running,
+                priced fairly, and actively maintained — rather than assuming free infrastructure
+                is a given.</p>
+            </div>
+            <div class="step">
+              <div class="i">For developers</div>
+              <h3>Back the builder, not just the API</h3>
+              <p>Pledges go directly to funding continued development — new endpoints, better
+                reliability, faster fixes — from an independent builder rather than a faceless
+                platform.</p>
+            </div>
+            <div class="step">
+              <div class="i">For everyone</div>
+              <h3>A visible, honest signal</h3>
+              <p>Your tier shows up publicly at the status endpoint below. It reflects that you
+                chose to support this project — nothing more, nothing certified.</p>
+            </div>
+          </div>
+
           <div class="rate">
+
             <div class="row">
               <span class="meth">POST</span><span class="nm">Lotus Supporter</span><span class="pr">$5/mo</span>
               <span class="ds">Entry-level monthly pledge.</span>
